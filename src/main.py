@@ -53,8 +53,8 @@ def train_pipeline():
     opt_class = optim.Adam(classifier.parameters(), lr=3e-4)
     
     criterion_class = torch.nn.CrossEntropyLoss()
-    scaler_gan = torch.cuda.amp.GradScaler()
-    scaler_class = torch.cuda.amp.GradScaler()
+    scaler_gan = torch.amp.GradScaler('cuda')
+    scaler_class = torch.amp.GradScaler('cuda')
     
     start_epoch = 0
 
@@ -95,7 +95,7 @@ def train_pipeline():
                 opt_critic.zero_grad()
                 scaler_gan.scale(loss_critic).backward()
                 scaler_gan.step(opt_critic)
-                scaler_gan.update() # ✅ MOVED HERE!
+                scaler_gan.update() 
                 
             # ---------------------
             # Train Generator
@@ -110,7 +110,7 @@ def train_pipeline():
             opt_gen.zero_grad()
             scaler_gan.scale(loss_gen).backward()
             scaler_gan.step(opt_gen)
-            scaler_gan.update() # ✅ MOVED HERE!
+            scaler_gan.update() 
             
             # ---------------------
             # Train EfficientNet Classifier
@@ -124,15 +124,17 @@ def train_pipeline():
             opt_class.zero_grad()
             scaler_class.scale(loss_class).backward()
             scaler_class.step(opt_class)
-            scaler_class.update() # ✅ MOVED HERE!
+            scaler_class.update() 
             
-        # (The rest of your print statements and torch.save code stays exactly the same below here)    print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | Gen Loss: {loss_gen.item():.4f} | Class Loss: {loss_class.item():.4f}")
+        # --- EPOCH WRAP-UP ---
         print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | Gen Loss: {loss_gen.item():.4f} | Class Loss: {loss_class.item():.4f}")
+        
         # --- SAVE SAMPLE FAKE IMAGES ---
         # Grabs the first 16 fake images from the last batch and saves them as a single PNG grid
         save_image(fresh_fake_imgs[:16].detach().cpu(), 
                    f"/kaggle/working/fake_samples_epoch_{epoch+1}.png", 
                    nrow=4, normalize=True)
+                   
         # --- SAVE CHECKPOINT AFTER EVERY EPOCH ---
         checkpoint = {
             'epoch': epoch,
