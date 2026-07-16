@@ -33,13 +33,14 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
 
 def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE}")
+
     # 1. Load Data
-    KAGGLE_DATA_PATH = "/kaggle/input/oral-processed/processed" # Explicit Kaggle path
+    KAGGLE_DATA_PATH = "/kaggle/input/datasets/anilk701/oral-processed/processed"
     
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
     train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=2)
-    
+
     # 2. Initialize Models
     gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(DEVICE)
     critic = Critic(num_classes=NUM_CLASSES).to(DEVICE)
