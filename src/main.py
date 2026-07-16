@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from dataset import OSCCDataset
 from gan_model import Generator, Critic
 from classifier import OSCC_Classifier
+from torchvision.utils import save_image
 
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
 BATCH_SIZE = 32      
@@ -127,6 +128,11 @@ def train_pipeline():
             
         # (The rest of your print statements and torch.save code stays exactly the same below here)    print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | Gen Loss: {loss_gen.item():.4f} | Class Loss: {loss_class.item():.4f}")
         print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | Gen Loss: {loss_gen.item():.4f} | Class Loss: {loss_class.item():.4f}")
+        # --- SAVE SAMPLE FAKE IMAGES ---
+        # Grabs the first 16 fake images from the last batch and saves them as a single PNG grid
+        save_image(fresh_fake_imgs[:16].detach().cpu(), 
+                   f"/kaggle/working/fake_samples_epoch_{epoch+1}.png", 
+                   nrow=4, normalize=True)
         # --- SAVE CHECKPOINT AFTER EVERY EPOCH ---
         checkpoint = {
             'epoch': epoch,
