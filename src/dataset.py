@@ -35,8 +35,8 @@ class OSCCDataset(Dataset):
     Custom PyTorch Dataset for loading 512x512 ORCHID Patches.
     Optimized for high-throughput GPU training pipelines.
     """
-    class OSCCDataset(Dataset):
-        def __init__(self, root_dir, phase='train', transform=None, use_normalization=True):
+   
+    def __init__(self, root_dir, phase='train', transform=None, use_normalization=True):
             # ❌ REMOVED the "smart" Kaggle redirect block!
             # ✅ Now it strictly trusts the path from main.py
             base_path = Path(root_dir)
