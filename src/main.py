@@ -80,11 +80,11 @@ def train_pipeline():
             cur_batch_size = real_imgs.shape[0]
             
             # ---------------------
-            # Train Critic
+            # Train Critic (Loops 5 times)
             # ---------------------
             for _ in range(5): 
                 noise = torch.randn(cur_batch_size, Z_DIM).to(DEVICE)
-                with torch.cuda.amp.autocast(): 
+                with torch.amp.autocast('cuda'): 
                     fake_imgs = gen(noise, labels)
                     critic_real = critic(real_imgs, labels).reshape(-1)
                     critic_fake = critic(fake_imgs.detach(), labels).reshape(-1)
@@ -94,15 +94,14 @@ def train_pipeline():
                 opt_critic.zero_grad()
                 scaler_gan.scale(loss_critic).backward()
                 scaler_gan.step(opt_critic)
+                scaler_gan.update() # ✅ MOVED HERE!
                 
-          
-           # ---------------------
+            # ---------------------
             # Train Generator
             # ---------------------
-            # Generate a fresh batch of noise/fakes for a clean computation graph
             fresh_noise = torch.randn(cur_batch_size, Z_DIM).to(DEVICE)
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 fresh_fake_imgs = gen(fresh_noise, labels)
                 gen_fake = critic(fresh_fake_imgs, labels).reshape(-1)
                 loss_gen = -torch.mean(gen_fake) 
@@ -110,12 +109,12 @@ def train_pipeline():
             opt_gen.zero_grad()
             scaler_gan.scale(loss_gen).backward()
             scaler_gan.step(opt_gen)
+            scaler_gan.update() # ✅ MOVED HERE!
             
             # ---------------------
             # Train EfficientNet Classifier
             # ---------------------
-            with torch.cuda.amp.autocast():
-                # Pool real data with the freshly generated fake data
+            with torch.amp.autocast('cuda'):
                 pooled_imgs = torch.cat([real_imgs, fresh_fake_imgs.detach()], dim=0)
                 pooled_labels = torch.cat([labels, labels], dim=0)
                 preds = classifier(pooled_imgs)
@@ -124,13 +123,10 @@ def train_pipeline():
             opt_class.zero_grad()
             scaler_class.scale(loss_class).backward()
             scaler_class.step(opt_class)
+            scaler_class.update() # ✅ MOVED HERE!
             
-            # ✅ Place updates together at the absolute end of the batch iteration
-            scaler_gan.update()
-            scaler_class.update()
-            
+        # (The rest of your print statements and torch.save code stays exactly the same below here)    print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | Gen Loss: {loss_gen.item():.4f} | Class Loss: {loss_class.item():.4f}")
         print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | Gen Loss: {loss_gen.item():.4f} | Class Loss: {loss_class.item():.4f}")
-        
         # --- SAVE CHECKPOINT AFTER EVERY EPOCH ---
         checkpoint = {
             'epoch': epoch,
