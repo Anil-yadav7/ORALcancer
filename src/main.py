@@ -11,11 +11,13 @@ from torchvision.utils import save_image
 BATCH_SIZE = 32      
 Z_DIM = 128
 NUM_CLASSES = 5
-TARGET_EPOCHS = 10   # Set how many epochs you want to run in this session
+TARGET_EPOCHS = 20   
 LAMBDA_GP = 10       
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth" 
 
+# 🚨 SPLIT YOUR PATHS SO THE PIPELINE KNOWS WHERE TO READ VS. WRITE
+LOAD_CHECKPOINT_PATH = "/kaggle/input/notebooks/anilk701/oralcancer/oscc_checkpoint.pth" 
+SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
 def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device):
     """Calculates WGAN-GP penalty to enforce Lipschitz constraint."""
     alpha = torch.rand((real_samples.size(0), 1, 1, 1), device=device)
@@ -59,9 +61,9 @@ def train_pipeline():
     start_epoch = 0
 
     # --- CHECKPOINT RESUME LOGIC ---
-    if os.path.exists(CHECKPOINT_PATH):
+    if os.path.exists(LOAD_CHECKPOINT_PATH):
         print("🔌 Found existing checkpoint! Resuming training...")
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=DEVICE)
         gen.load_state_dict(checkpoint['gen_state'])
         critic.load_state_dict(checkpoint['critic_state'])
         classifier.load_state_dict(checkpoint['class_state'])
@@ -145,7 +147,7 @@ def train_pipeline():
             'opt_critic_state': opt_critic.state_dict(),
             'opt_class_state': opt_class.state_dict()
         }
-        torch.save(checkpoint, CHECKPOINT_PATH)
+        torch.save(checkpoint, SAVE_CHECKPOINT_PATH)
         
 if __name__ == "__main__":
     train_pipeline()
