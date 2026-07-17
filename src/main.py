@@ -16,7 +16,7 @@ LAMBDA_GP = 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 🚨 SPLIT YOUR PATHS SO THE PIPELINE KNOWS WHERE TO READ VS. WRITE
-LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/anilk701/checkpoint-20" 
+LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/anilk701/check20/oscc_checkpoint201.bin" 
 SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
 def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device):
     """Calculates WGAN-GP penalty to enforce Lipschitz constraint."""
