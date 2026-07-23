@@ -11,7 +11,7 @@ from torchvision.utils import save_image
 BATCH_SIZE = 32      
 Z_DIM = 128
 NUM_CLASSES = 5
-TARGET_EPOCHS = 150
+TARGET_EPOCHS = 145
 LAMBDA_GP = 10       
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
