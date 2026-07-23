@@ -11,7 +11,7 @@ from torchvision.utils import save_image
 BATCH_SIZE = 32      
 Z_DIM = 128
 NUM_CLASSES = 5
-TARGET_EPOCHS = 145
+TARGET_EPOCHS = 150
 LAMBDA_GP = 10       
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -38,7 +38,7 @@ def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE}")
 
     # 1. Load Data
-    KAGGLE_DATA_PATH = "/kaggle/input/datasets/anilk701/oral-processed/processed"
+    KAGGLE_DATA_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/oral-processed/processed"
     
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
     train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
