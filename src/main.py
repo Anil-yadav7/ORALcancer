@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.models as models
 from torch.utils.data import DataLoader
+from torchvision import transforms
 from sklearn.metrics import accuracy_score, f1_score
 from dataset import OSCCDataset
 from gan_model import Generator, Critic
@@ -25,6 +26,14 @@ EMA_DECAY = 0.999          # Standard GAN EMA decay; higher = smoother/slower-fo
 FID_EVERY = 5               # Compute FID every N epochs (it's expensive, don't run every epoch)
 FID_NUM_SAMPLES = 300        # How many real/fake images to compare for FID
 LR_DECAY_START_EPOCH = 100   # Cosine decay kicks in after this epoch (absolute epoch count)
+
+# --- NEW: classifier overfitting fixes ---
+# Val accuracy plateaued at ~0.60-0.63 while train Class Loss collapsed to ~0.0002 —
+# a clear overfitting signature on the ~150-patient cohort. These settings address it.
+CLASS_DROPOUT = 0.5
+CLASS_WEIGHT_DECAY = 1e-4
+CLASS_PARTIAL_FREEZE = True
+CLASS_PARTIAL_FREEZE_RATIO = 0.7   # freeze earliest 70% of EfficientNet feature blocks
 
 LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/checkpoint145/oscc_checkpoint.bin"
 SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
@@ -182,7 +191,26 @@ def train_pipeline():
     KAGGLE_DATA_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/oral-processed/processed"
 
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
-    train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
+
+    # --- NEW: light augmentation for the training set. Histopathology patches have
+    # no canonical orientation, so flips/rotation are label-preserving and effectively
+    # free regularization for the classifier. Kept mild (no heavy color jitter) since
+    # over-augmenting could distort the stain-normalized color statistics the
+    # ReinhardNormalizer already standardized. Applied AFTER stain normalization
+    # (see dataset.py __getitem__ ordering), so it doesn't interfere with that step.
+    # NOTE: this augments the same real images used for critic/generator training too
+    # (not just the classifier's branch) — differentiable augmentation of reals is a
+    # well-established, generally beneficial practice for GAN training, not just
+    # something tacked on for the classifier.
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train", transform=train_transform)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=2)
 
     # --- NEW: validation set ---
@@ -206,7 +234,12 @@ def train_pipeline():
     # 2. Initialize Models
     gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(DEVICE)
     critic = Critic(num_classes=NUM_CLASSES).to(DEVICE)
-    classifier = OSCC_Classifier(num_classes=NUM_CLASSES).to(DEVICE)
+    classifier = OSCC_Classifier(
+        num_classes=NUM_CLASSES,
+        partial_freeze=CLASS_PARTIAL_FREEZE,
+        partial_freeze_ratio=CLASS_PARTIAL_FREEZE_RATIO,
+        dropout_p=CLASS_DROPOUT,
+    ).to(DEVICE)
     perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
 
     # --- NEW: EMA generator (a smoothed shadow copy, used for sampling/FID/classifier data) ---
@@ -218,7 +251,12 @@ def train_pipeline():
     # 3. Optimizers
     opt_gen = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
     opt_critic = optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
-    opt_class = optim.Adam(classifier.parameters(), lr=3e-4)
+    # NEW: only pass trainable (non-frozen) params to the optimizer, and add weight
+    # decay — the previous opt_class had no regularization at all, which combined
+    # with full end-to-end fine-tuning on ~150 patients is a big part of why train
+    # loss collapsed to ~0.0002 while val accuracy sat flat at ~0.60-0.63.
+    trainable_class_params = filter(lambda p: p.requires_grad, classifier.parameters())
+    opt_class = optim.Adam(trainable_class_params, lr=3e-4, weight_decay=CLASS_WEIGHT_DECAY)
 
     criterion_class = torch.nn.CrossEntropyLoss()
     scaler_gan = torch.amp.GradScaler('cuda')
@@ -235,7 +273,17 @@ def train_pipeline():
         classifier.load_state_dict(checkpoint['class_state'])
         opt_gen.load_state_dict(checkpoint['opt_gen_state'])
         opt_critic.load_state_dict(checkpoint['opt_critic_state'])
-        opt_class.load_state_dict(checkpoint['opt_class_state'])
+
+        # NEW: opt_class is intentionally NOT restored from the checkpoint. Partial
+        # freezing changed which parameters are trainable, so the old optimizer
+        # state (sized for the previous, fully-trainable parameter set) is no longer
+        # compatible and would raise a size-mismatch error if loaded. This only
+        # resets classifier optimizer momentum — the classifier's LEARNED WEIGHTS
+        # still load normally below via classifier.load_state_dict(), and the GAN
+        # (gen/critic/ema_gen) is fully restored. Adam's momentum re-warms up within
+        # a handful of steps, so this is a minor, contained reset — not a restart.
+        print("ℹ️ Classifier optimizer reset (partial-freeze changes trainable params) — "
+              "generator, critic, EMA generator, and classifier weights all restored normally.")
         start_epoch = checkpoint['epoch'] + 1
 
         # NEW: EMA state may not exist in old checkpoints (e.g. your epoch-145 one).
