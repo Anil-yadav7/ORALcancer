@@ -37,8 +37,6 @@ class OSCCDataset(Dataset):
     """
    
     def __init__(self, root_dir, phase='train', transform=None, use_normalization=True):
-            # ❌ REMOVED the "smart" Kaggle redirect block!
-            # ✅ Now it strictly trusts the path from main.py
             base_path = Path(root_dir)
             
             self.root_dir = base_path / phase
