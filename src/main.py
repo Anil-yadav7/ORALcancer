@@ -37,7 +37,7 @@ CLASS_WEIGHT_DECAY = 1e-4
 CLASS_PARTIAL_FREEZE = True
 CLASS_PARTIAL_FREEZE_RATIO = 0.7   # freeze earliest 70% of EfficientNet feature blocks
 
-LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/checkpoint145/oscc_checkpoint.bin"
+LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/145-175check"
 SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
 
 
