@@ -197,7 +197,7 @@ classifier_augment = v2.Compose([
 def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE}")
 
-    KAGGLE_DATA_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/oral-processed/processed"
+    KAGGLE_DATA_PATH = "/kaggle/input/datasets/anilk701/oral-processed/processed"
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
 
     train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
