@@ -6,6 +6,7 @@ import torch.optim as optim
 import torchvision.models as models
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.transforms import v2
 from sklearn.metrics import accuracy_score, f1_score
 from dataset import OSCCDataset
 from gan_model import Generator, Critic
@@ -16,7 +17,7 @@ from torchvision.utils import save_image
 BATCH_SIZE = 32
 Z_DIM = 128
 NUM_CLASSES = 5
-TARGET_EPOCHS = 155
+TARGET_EPOCHS = 175
 LAMBDA_GP = 10
 LAMBDA_PERC = 0.5    # Multiplier for VGG Perceptual Loss
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -26,6 +27,7 @@ EMA_DECAY = 0.999          # Standard GAN EMA decay; higher = smoother/slower-fo
 FID_EVERY = 5               # Compute FID every N epochs (it's expensive, don't run every epoch)
 FID_NUM_SAMPLES = 300        # How many real/fake images to compare for FID
 LR_DECAY_START_EPOCH = 100   # Cosine decay kicks in after this epoch (absolute epoch count)
+GEN_GRAD_CLIP_NORM = 5.0     # NEW: clip generator gradient norm to curb large destabilizing steps
 
 # --- NEW: classifier overfitting fixes ---
 # Val accuracy plateaued at ~0.60-0.63 while train Class Loss collapsed to ~0.0002 —
@@ -184,6 +186,20 @@ def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, 
     return fid_metric.compute().item()
 
 
+# --- NEW: classifier-only augmentation, applied directly to already-loaded tensors.
+# This runs ONLY on the copy fed to the classifier, never on the real_imgs used by
+# the critic/generator — keeping the GAN's view of "real" completely clean.
+# Operates in the [-1, 1] normalized tensor space (post ReinhardNormalizer +
+# ToTensor + Normalize), so any rotation gap is filled with 0.0 here, which
+# corresponds to mid-gray in pixel space — NOT black — avoiding the artifact issue
+# that affected the GAN when augmentation lived in the shared dataset transform.
+classifier_augment = v2.Compose([
+    v2.RandomHorizontalFlip(p=0.5),
+    v2.RandomVerticalFlip(p=0.5),
+    v2.RandomRotation(degrees=15, fill=0.0),
+])
+
+
 def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE}")
 
@@ -192,25 +208,16 @@ def train_pipeline():
 
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
 
-    # --- NEW: light augmentation for the training set. Histopathology patches have
-    # no canonical orientation, so flips/rotation are label-preserving and effectively
-    # free regularization for the classifier. Kept mild (no heavy color jitter) since
-    # over-augmenting could distort the stain-normalized color statistics the
-    # ReinhardNormalizer already standardized. Applied AFTER stain normalization
-    # (see dataset.py __getitem__ ordering), so it doesn't interfere with that step.
-    # NOTE: this augments the same real images used for critic/generator training too
-    # (not just the classifier's branch) — differentiable augmentation of reals is a
-    # well-established, generally beneficial practice for GAN training, not just
-    # something tacked on for the classifier.
-    train_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=15),
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    ])
-    train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train", transform=train_transform)
+    # NOTE: train_dataset now uses the dataset's DEFAULT (unaugmented) transform.
+    # Augmentation moved to a separate, tensor-space step applied ONLY to the
+    # classifier's real-image branch inside the training loop (see
+    # `classifier_augment` below). Previously, flip/rotation augmentation was baked
+    # into this dataset's transform, which meant the CRITIC also saw augmented reals —
+    # RandomRotation's default black-corner fill gave the critic a trivial artifact to
+    # key on (real images had black wedges, generator output never did), which is the
+    # likely cause of the FID regression (173 -> 218) and widened loss swings in the
+    # last run. Keeping this dataset clean fixes that at the source.
+    train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=2)
 
     # --- NEW: validation set ---
@@ -301,14 +308,30 @@ def train_pipeline():
         print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
         ema_gen.load_state_dict(gen.state_dict())
 
-    # --- NEW: cosine LR decay for the remaining epochs (recomputed on every resume,
-    # so it doesn't need extra state saved in the checkpoint). If you're resuming
-    # mid-decay across multiple Kaggle sessions, the curve restarts relative to the
-    # current start_epoch each time rather than continuing the exact previous curve —
-    # a reasonable tradeoff for simplicity, but worth knowing about.
-    remaining_epochs = max(TARGET_EPOCHS - max(start_epoch, LR_DECAY_START_EPOCH), 1)
-    sched_gen = optim.lr_scheduler.CosineAnnealingLR(opt_gen, T_max=remaining_epochs)
-    sched_critic = optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=remaining_epochs)
+    # --- FIXED: cosine LR decay now uses a FIXED span (LR_DECAY_START_EPOCH ->
+    # TARGET_EPOCHS = 75 epochs), not "however many epochs are left in this session".
+    # Previously, resuming at epoch 146 with TARGET_EPOCHS=155 gave T_max=9, so the
+    # schedule hit LR=0.00e+00 by epoch 155 — silently halting training. Now T_max is
+    # fixed at the true decay span, and `last_epoch` is set to reflect how many decay
+    # steps have already elapsed, so the curve picks up where it left off instead of
+    # restarting a short, steep decay on every resume.
+    decay_span = max(TARGET_EPOCHS - LR_DECAY_START_EPOCH, 1)
+    elapsed_decay_epochs = max(start_epoch - LR_DECAY_START_EPOCH, 0)
+    last_epoch_init = elapsed_decay_epochs - 1  # -1 = "no steps taken yet" (PyTorch convention)
+
+    # Schedulers require 'initial_lr' on each param_group when constructed with
+    # last_epoch != -1 (normally auto-set only when last_epoch == -1).
+    for opt in (opt_gen, opt_critic):
+        for group in opt.param_groups:
+            group.setdefault('initial_lr', group['lr'])
+
+    sched_gen = optim.lr_scheduler.CosineAnnealingLR(opt_gen, T_max=decay_span, last_epoch=last_epoch_init)
+    sched_critic = optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=decay_span, last_epoch=last_epoch_init)
+    # CAVEAT: this fix only works correctly if TARGET_EPOCHS stays the same value
+    # (175) across every Kaggle session from now on. Your last few runs used 145,
+    # then 155 — if TARGET_EPOCHS keeps changing between resumes, decay_span changes
+    # with it and you're back to the same problem. Keep TARGET_EPOCHS = 175 fixed
+    # going forward; the script will still stop naturally once `epoch` reaches it.
 
     # --- TRAINING LOOP ---
     print("🔥 Starting Training...")
@@ -354,6 +377,12 @@ def train_pipeline():
 
             opt_gen.zero_grad()
             scaler_gan.scale(loss_gen).backward()
+            # NEW: clip generator gradients before stepping. Must unscale first since
+            # gradients are currently AMP-scaled — clipping the scaled values directly
+            # would clip against the wrong magnitude. This targets the large single-
+            # epoch Gen Adv swings (-310, -192) seen in recent runs.
+            scaler_gan.unscale_(opt_gen)
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), max_norm=GEN_GRAD_CLIP_NORM)
             scaler_gan.step(opt_gen)
             scaler_gan.update()
 
@@ -371,9 +400,12 @@ def train_pipeline():
             with torch.no_grad():
                 ema_noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
                 ema_fake_imgs = ema_gen(ema_noise, labels)
+                # NEW: augment only the real half fed to the classifier. real_imgs
+                # itself (used above for critic/generator training) is never touched.
+                aug_real_imgs = classifier_augment(real_imgs)
 
             with torch.amp.autocast('cuda'):
-                pooled_imgs = torch.cat([real_imgs, ema_fake_imgs], dim=0)
+                pooled_imgs = torch.cat([aug_real_imgs, ema_fake_imgs], dim=0)
                 pooled_labels = torch.cat([labels, labels], dim=0)
                 preds = classifier(pooled_imgs)
                 loss_class = criterion_class(preds, pooled_labels)

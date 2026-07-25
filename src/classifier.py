@@ -7,18 +7,17 @@ class OSCC_Classifier(nn.Module):
     Modified EfficientNet-B4 for OSCC Histopathological Grading.
     Pre-trained on ImageNet, fine-tuned for 5-class tissue differentiation.
     """
-    def __init__(self, num_classes=5, freeze_backbone=False, partial_freeze=False,
+    def __init__(self, num_classes=5, partial_freeze=False,
                  partial_freeze_ratio=0.7, dropout_p=0.4):
         """
-        freeze_backbone: freeze the ENTIRE EfficientNet backbone (original behavior).
-        partial_freeze: NEW — freeze only the earliest `partial_freeze_ratio` fraction
+        partial_freeze: freeze only the earliest `partial_freeze_ratio` fraction
             of feature blocks, leaving the later blocks + head trainable. This is a
             regularization measure for small datasets (e.g. ~150-patient cohorts):
             early conv layers encode generic low-level texture/edge features that
             don't need to be re-learned, so freezing them cuts the number of trainable
             parameters substantially and reduces overfitting risk, while still letting
             the network adapt its higher-level, task-specific representations.
-        dropout_p: NEW — configurable dropout before the final linear layer
+        dropout_p: configurable dropout before the final linear layer
             (was hardcoded to 0.4; raise this, e.g. to 0.5, if still overfitting).
         """
         super(OSCC_Classifier, self).__init__()
@@ -37,9 +36,6 @@ class OSCC_Classifier(nn.Module):
                         frozen_params += param.numel()
             print(f"🧊 Partial freeze: locked feature blocks 0-{freeze_until - 1} "
                   f"of {total_blocks} ({frozen_params:,} params frozen).")
-        elif freeze_backbone:
-            for param in self.model.parameters():
-                param.requires_grad = False
 
         num_ftrs = self.model.classifier[1].in_features
 
