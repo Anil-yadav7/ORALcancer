@@ -37,7 +37,7 @@ CLASS_WEIGHT_DECAY = 1e-4
 CLASS_PARTIAL_FREEZE = True
 CLASS_PARTIAL_FREEZE_RATIO = 0.7   # freeze earliest 70% of EfficientNet feature blocks
 
-LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/145-175check/oscc_checkpoint1.bin"
+LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/checkpoint145/oscc_checkpoint.bin"
 SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
 
 
@@ -308,30 +308,47 @@ def train_pipeline():
         print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
         ema_gen.load_state_dict(gen.state_dict())
 
-    # --- FIXED: cosine LR decay now uses a FIXED span (LR_DECAY_START_EPOCH ->
-    # TARGET_EPOCHS = 75 epochs), not "however many epochs are left in this session".
-    # Previously, resuming at epoch 146 with TARGET_EPOCHS=155 gave T_max=9, so the
-    # schedule hit LR=0.00e+00 by epoch 155 — silently halting training. Now T_max is
-    # fixed at the true decay span, and `last_epoch` is set to reflect how many decay
-    # steps have already elapsed, so the curve picks up where it left off instead of
-    # restarting a short, steep decay on every resume.
-    decay_span = max(TARGET_EPOCHS - LR_DECAY_START_EPOCH, 1)
-    elapsed_decay_epochs = max(start_epoch - LR_DECAY_START_EPOCH, 0)
-    last_epoch_init = elapsed_decay_epochs - 1  # -1 = "no steps taken yet" (PyTorch convention)
-
-    # Schedulers require 'initial_lr' on each param_group when constructed with
-    # last_epoch != -1 (normally auto-set only when last_epoch == -1).
+    # --- FIXED (v2): the previous fix constructed CosineAnnealingLR directly at
+    # last_epoch=N on resume. That doesn't work correctly: PyTorch's
+    # CosineAnnealingLR computes lr via a step-by-step RECURRENCE that depends on
+    # whatever `lr` is CURRENTLY sitting in the optimizer at each .step() call — it
+    # is not a pure function of epoch number. Since opt_gen_state/opt_critic_state
+    # were just loaded from a checkpoint whose lr had already decayed to 0.0 (from
+    # the earlier buggy short-T_max run), constructing the scheduler at
+    # last_epoch=55 silently reused that stale 0.0 instead of recomputing from the
+    # true base lr — which is exactly why every epoch from 146 through 167 in your
+    # logs shows LR(gen/critic): 0.00e+00. The GAN has effectively been frozen
+    # (zero-magnitude weight updates) that whole time, while ema_gen kept drifting
+    # toward that one frozen, mediocre snapshot instead of a real trajectory —
+    # which is why FID kept climbing (218 -> 236 -> 244) instead of holding steady.
+    #
+    # Fix: explicitly reset lr/initial_lr to the true base value (ignore whatever
+    # the checkpoint has), construct the scheduler fresh at last_epoch=-1, then
+    # REPLAY the correct number of .step() calls so the recurrence is walked
+    # through properly instead of jumped to directly.
+    BASE_LR = 1e-4
     for opt in (opt_gen, opt_critic):
         for group in opt.param_groups:
-            group.setdefault('initial_lr', group['lr'])
+            group['lr'] = BASE_LR
+            group['initial_lr'] = BASE_LR
 
-    sched_gen = optim.lr_scheduler.CosineAnnealingLR(opt_gen, T_max=decay_span, last_epoch=last_epoch_init)
-    sched_critic = optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=decay_span, last_epoch=last_epoch_init)
-    # CAVEAT: this fix only works correctly if TARGET_EPOCHS stays the same value
-    # (175) across every Kaggle session from now on. Your last few runs used 145,
-    # then 155 — if TARGET_EPOCHS keeps changing between resumes, decay_span changes
-    # with it and you're back to the same problem. Keep TARGET_EPOCHS = 175 fixed
-    # going forward; the script will still stop naturally once `epoch` reaches it.
+    decay_span = max(TARGET_EPOCHS - LR_DECAY_START_EPOCH, 1)
+    elapsed_decay_epochs = max(start_epoch - LR_DECAY_START_EPOCH, 0)
+
+    sched_gen = optim.lr_scheduler.CosineAnnealingLR(opt_gen, T_max=decay_span)
+    sched_critic = optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=decay_span)
+
+    for _ in range(elapsed_decay_epochs):
+        sched_gen.step()
+        sched_critic.step()
+
+    print(f"🔧 LR schedule rebuilt: base={BASE_LR:.2e}, decay_span={decay_span}, "
+          f"replayed {elapsed_decay_epochs} decay step(s) -> "
+          f"current LR(gen/critic)={opt_gen.param_groups[0]['lr']:.2e}/{opt_critic.param_groups[0]['lr']:.2e}")
+    # CAVEAT: this still only works correctly if TARGET_EPOCHS stays the same value
+    # (175) across every Kaggle session from now on — if it keeps changing between
+    # resumes, decay_span changes with it. Keep TARGET_EPOCHS = 175 fixed going
+    # forward; the script will still stop naturally once `epoch` reaches it.
 
     # --- TRAINING LOOP ---
     print("🔥 Starting Training...")
