@@ -17,7 +17,7 @@ from torchvision.utils import save_image
 BATCH_SIZE = 32
 Z_DIM = 128
 NUM_CLASSES = 5
-TARGET_EPOCHS = 25
+TARGET_EPOCHS = 200
 LAMBDA_GP = 10
 LAMBDA_PERC = 0.5    # Multiplier for VGG Perceptual Loss
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
