@@ -17,24 +17,33 @@ from torchvision.utils import save_image
 BATCH_SIZE = 32
 Z_DIM = 128
 NUM_CLASSES = 5
-TARGET_EPOCHS = 200
+TARGET_EPOCHS = 200          # synced to the fresh run currently in progress
 LAMBDA_GP = 10
 LAMBDA_PERC = 0.5    # Multiplier for VGG Perceptual Loss
+N_CRITIC = 3   # NEW: was 5. FID plateaued ~epoch 20-44 (160-169 band) with Critic Loss
+               # swinging widely (-4.7 to -75) — the critic getting 5 updates per 1
+               # generator update looks like it's outpacing the generator enough to
+               # stall its progress. Dropping to 3:1 gives the generator relatively
+               # more influence per critic update, without abandoning WGAN-GP's need
+               # for a well-trained critic entirely.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- EMA / validation / FID settings ---
+# --- NEW: EMA / validation / FID settings ---
 EMA_DECAY = 0.999          # Standard GAN EMA decay; higher = smoother/slower-following
 FID_EVERY = 5               # Compute FID every N epochs (it's expensive, don't run every epoch)
 FID_NUM_SAMPLES = 300        # How many real/fake images to compare for FID
 LR_DECAY_START_EPOCH = 100   # Cosine decay kicks in after this epoch (absolute epoch count)
-GEN_GRAD_CLIP_NORM = 5.0     # clip generator gradient norm to curb large destabilizing steps
+GEN_GRAD_CLIP_NORM = 5.0     # NEW: clip generator gradient norm to curb large destabilizing steps
 
+# --- NEW: classifier overfitting fixes ---
+# Val accuracy plateaued at ~0.60-0.63 while train Class Loss collapsed to ~0.0002 —
+# a clear overfitting signature on the ~150-patient cohort. These settings address it.
 CLASS_DROPOUT = 0.5
 CLASS_WEIGHT_DECAY = 1e-4
 CLASS_PARTIAL_FREEZE = True
 CLASS_PARTIAL_FREEZE_RATIO = 0.7   # freeze earliest 70% of EfficientNet feature blocks
 
-LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/anilk701/oraldataset/oscc_checkpoint.bin"
+LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/checkpoint145/oscc_checkpoint.bin"
 SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
 
 
@@ -57,20 +66,20 @@ class VGGPerceptualLoss(nn.Module):
 
         for param in self.parameters():
             param.requires_grad = False
-            
-        # NEW: ImageNet normalization to align domains properly for VGG
-        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                              std=[0.229, 0.224, 0.225])
 
     def forward(self, X, Y):
-        # Shift back from [-1, 1] to [0, 1]
+        # 1. Map from [-1, 1] to [0, 1]
         X = (X + 1.0) / 2.0
         Y = (Y + 1.0) / 2.0
-        
-        # Apply standard ImageNet normalization for VGG feature extraction
-        X = self.normalize(X)
-        Y = self.normalize(Y)
 
+        # 2. Apply ImageNet Normalization (expected by VGG16 weights)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=X.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=X.device).view(1, 3, 1, 1)
+        
+        X = (X - mean) / std
+        Y = (Y - mean) / std
+
+        # 3. Pass through slices
         h_x1 = self.slice1(X)
         h_y1 = self.slice1(Y)
         h_x2 = self.slice2(h_x1)
@@ -104,10 +113,13 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
     return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
 
+# --- NEW: EMA helper ---
 @torch.no_grad()
 def update_ema(ema_model, model, decay):
     """
-    Exponential moving average update over the FULL state_dict (params + buffers).
+    Exponential moving average update over the FULL state_dict (params + buffers,
+    e.g. BatchNorm running_mean/running_var). Non-floating buffers (like
+    num_batches_tracked) are copied directly rather than averaged.
     """
     ema_state = ema_model.state_dict()
     model_state = model.state_dict()
@@ -120,6 +132,7 @@ def update_ema(ema_model, model, decay):
             ema_tensor.copy_(model_tensor)
 
 
+# --- NEW: classifier validation loop ---
 @torch.no_grad()
 def run_validation(classifier, val_loader, device):
     classifier.eval()
@@ -144,12 +157,14 @@ def run_validation(classifier, val_loader, device):
     return avg_loss, acc, macro_f1
 
 
+# --- NEW: FID tracking (uses torchmetrics; pip install torchmetrics[image] if missing) ---
 def build_fid_metric(device):
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
     except ImportError:
         print("⚠️ torchmetrics not found. Run: pip install torchmetrics[image]")
         return None
+    # normalize=False -> expects uint8 images in [0, 255]
     return FrechetInceptionDistance(feature=2048, normalize=False).to(device)
 
 
@@ -178,8 +193,7 @@ def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, 
         fakes = ema_gen(noise, labels)
         fake_batches.append(to_uint8(fakes))
         remaining -= cur
-    
-    # REMOVED: ema_gen.train() - Do not switch back to train mode
+    ema_gen.train()
 
     fake_batch = torch.cat(fake_batches, dim=0)
     fid_metric.update(fake_batch, real=False)
@@ -187,6 +201,13 @@ def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, 
     return fid_metric.compute().item()
 
 
+# --- NEW: classifier-only augmentation, applied directly to already-loaded tensors.
+# This runs ONLY on the copy fed to the classifier, never on the real_imgs used by
+# the critic/generator — keeping the GAN's view of "real" completely clean.
+# Operates in the [-1, 1] normalized tensor space (post ReinhardNormalizer +
+# ToTensor + Normalize), so any rotation gap is filled with 0.0 here, which
+# corresponds to mid-gray in pixel space — NOT black — avoiding the artifact issue
+# that affected the GAN when augmentation lived in the shared dataset transform.
 classifier_augment = v2.Compose([
     v2.RandomHorizontalFlip(p=0.5),
     v2.RandomVerticalFlip(p=0.5),
@@ -197,16 +218,29 @@ classifier_augment = v2.Compose([
 def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE}")
 
-    KAGGLE_DATA_PATH = "/kaggle/input/datasets/anilk701/oral-processed/processed"
+    # 1. Load Data
+    KAGGLE_DATA_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/oral-processed/processed"
+
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
 
+    # NOTE: train_dataset now uses the dataset's DEFAULT (unaugmented) transform.
+    # Augmentation moved to a separate, tensor-space step applied ONLY to the
+    # classifier's real-image branch inside the training loop (see
+    # `classifier_augment` below). Previously, flip/rotation augmentation was baked
+    # into this dataset's transform, which meant the CRITIC also saw augmented reals —
+    # RandomRotation's default black-corner fill gave the critic a trivial artifact to
+    # key on (real images had black wedges, generator output never did), which is the
+    # likely cause of the FID regression (173 -> 218) and widened loss swings in the
+    # last run. Keeping this dataset clean fixes that at the source.
     train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=2)
 
+    # --- NEW: validation set ---
     val_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="val")
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
     print(f"📂 Validation set loaded: {len(val_dataset)} images")
 
+    # --- NEW: fixed reference batch of real images for FID (consistent across epochs) ---
     fid_metric = build_fid_metric(DEVICE)
     real_ref_imgs = None
     if fid_metric is not None:
@@ -219,6 +253,7 @@ def train_pipeline():
                 break
         real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
 
+    # 2. Initialize Models
     gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(DEVICE)
     critic = Critic(num_classes=NUM_CLASSES).to(DEVICE)
     classifier = OSCC_Classifier(
@@ -229,23 +264,32 @@ def train_pipeline():
     ).to(DEVICE)
     perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
 
+    # --- NEW: EMA generator (a smoothed shadow copy, used for sampling/FID/classifier data) ---
     ema_gen = copy.deepcopy(gen).to(DEVICE)
     for p in ema_gen.parameters():
         p.requires_grad = False
     ema_gen.eval()
 
+    # 3. Optimizers
     opt_gen = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
     opt_critic = optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
-    
+    # NEW: only pass trainable (non-frozen) params to the optimizer, and add weight
+    # decay — the previous opt_class had no regularization at all, which combined
+    # with full end-to-end fine-tuning on ~150 patients is a big part of why train
+    # loss collapsed to ~0.0002 while val accuracy sat flat at ~0.60-0.63.
     trainable_class_params = filter(lambda p: p.requires_grad, classifier.parameters())
     opt_class = optim.Adam(trainable_class_params, lr=3e-4, weight_decay=CLASS_WEIGHT_DECAY)
 
     criterion_class = torch.nn.CrossEntropyLoss()
-    scaler_gan = torch.amp.GradScaler('cuda')
+    
+    # --- UPDATED: Separated GradScalers to prevent inf/NaN gradient collisions ---
+    scaler_gen = torch.amp.GradScaler('cuda')
+    scaler_critic = torch.amp.GradScaler('cuda')
     scaler_class = torch.amp.GradScaler('cuda')
 
     start_epoch = 0
 
+    # --- CHECKPOINT RESUME LOGIC ---
     if os.path.exists(LOAD_CHECKPOINT_PATH):
         print("🔌 Found existing checkpoint! Resuming training...")
         checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=DEVICE)
@@ -255,10 +299,21 @@ def train_pipeline():
         opt_gen.load_state_dict(checkpoint['opt_gen_state'])
         opt_critic.load_state_dict(checkpoint['opt_critic_state'])
 
+        # NEW: opt_class is intentionally NOT restored from the checkpoint. Partial
+        # freezing changed which parameters are trainable, so the old optimizer
+        # state (sized for the previous, fully-trainable parameter set) is no longer
+        # compatible and would raise a size-mismatch error if loaded. This only
+        # resets classifier optimizer momentum — the classifier's LEARNED WEIGHTS
+        # still load normally below via classifier.load_state_dict(), and the GAN
+        # (gen/critic/ema_gen) is fully restored. Adam's momentum re-warms up within
+        # a handful of steps, so this is a minor, contained reset — not a restart.
         print("ℹ️ Classifier optimizer reset (partial-freeze changes trainable params) — "
               "generator, critic, EMA generator, and classifier weights all restored normally.")
         start_epoch = checkpoint['epoch'] + 1
 
+        # NEW: EMA state may not exist in old checkpoints (e.g. your epoch-145 one).
+        # If missing, bootstrap EMA weights from the current generator instead of
+        # crashing or silently starting EMA from random init.
         if 'ema_gen_state' in checkpoint:
             ema_gen.load_state_dict(checkpoint['ema_gen_state'])
             print("✅ Restored EMA generator from checkpoint.")
@@ -271,6 +326,24 @@ def train_pipeline():
         print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
         ema_gen.load_state_dict(gen.state_dict())
 
+    # --- FIXED (v2): the previous fix constructed CosineAnnealingLR directly at
+    # last_epoch=N on resume. That doesn't work correctly: PyTorch's
+    # CosineAnnealingLR computes lr via a step-by-step RECURRENCE that depends on
+    # whatever `lr` is CURRENTLY sitting in the optimizer at each .step() call — it
+    # is not a pure function of epoch number. Since opt_gen_state/opt_critic_state
+    # were just loaded from a checkpoint whose lr had already decayed to 0.0 (from
+    # the earlier buggy short-T_max run), constructing the scheduler at
+    # last_epoch=55 silently reused that stale 0.0 instead of recomputing from the
+    # true base lr — which is exactly why every epoch from 146 through 167 in your
+    # logs shows LR(gen/critic): 0.00e+00. The GAN has effectively been frozen
+    # (zero-magnitude weight updates) that whole time, while ema_gen kept drifting
+    # toward that one frozen, mediocre snapshot instead of a real trajectory —
+    # which is why FID kept climbing (218 -> 236 -> 244) instead of holding steady.
+    #
+    # Fix: explicitly reset lr/initial_lr to the true base value (ignore whatever
+    # the checkpoint has), construct the scheduler fresh at last_epoch=-1, then
+    # REPLAY the correct number of .step() calls so the recurrence is walked
+    # through properly instead of jumped to directly.
     BASE_LR = 1e-4
     for opt in (opt_gen, opt_critic):
         for group in opt.param_groups:
@@ -280,22 +353,33 @@ def train_pipeline():
     decay_span = max(TARGET_EPOCHS - LR_DECAY_START_EPOCH, 1)
     elapsed_decay_epochs = max(start_epoch - LR_DECAY_START_EPOCH, 0)
 
-    # FIXED: Replaced loop with correct last_epoch setting
-    start_step = elapsed_decay_epochs - 1 if elapsed_decay_epochs > 0 else -1
+    sched_gen = optim.lr_scheduler.CosineAnnealingLR(opt_gen, T_max=decay_span)
+    sched_critic = optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=decay_span)
 
-    sched_gen = optim.lr_scheduler.CosineAnnealingLR(opt_gen, T_max=decay_span, last_epoch=start_step)
-    sched_critic = optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=decay_span, last_epoch=start_step)
+    for _ in range(elapsed_decay_epochs):
+        sched_gen.step()
+        sched_critic.step()
 
     print(f"🔧 LR schedule rebuilt: base={BASE_LR:.2e}, decay_span={decay_span}, "
+          f"replayed {elapsed_decay_epochs} decay step(s) -> "
           f"current LR(gen/critic)={opt_gen.param_groups[0]['lr']:.2e}/{opt_critic.param_groups[0]['lr']:.2e}")
+    # CAVEAT: this still only works correctly if TARGET_EPOCHS stays the same value
+    # (200, your fresh run's target) across every Kaggle session from now on — if it
+    # keeps changing between resumes, decay_span changes with it. Keep
+    # TARGET_EPOCHS = 200 fixed going forward; the script will still stop naturally
+    # once `epoch` reaches it.
 
+    # --- TRAINING LOOP ---
     print("🔥 Starting Training...")
     for epoch in range(start_epoch, TARGET_EPOCHS):
         for batch_idx, (real_imgs, labels) in enumerate(train_loader):
             real_imgs, labels = real_imgs.to(DEVICE), labels.to(DEVICE)
             cur_batch_size = real_imgs.shape[0]
 
-            for _ in range(5):
+            # ---------------------
+            # Train Critic (N_CRITIC steps per generator step)
+            # ---------------------
+            for _ in range(N_CRITIC):
                 noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
 
                 with torch.amp.autocast('cuda'):
@@ -308,10 +392,13 @@ def train_pipeline():
                 loss_critic = loss_critic_base + (LAMBDA_GP * gp)
 
                 opt_critic.zero_grad()
-                scaler_gan.scale(loss_critic).backward()
-                scaler_gan.step(opt_critic)
-                scaler_gan.update()
+                scaler_critic.scale(loss_critic).backward()
+                scaler_critic.step(opt_critic)
+                scaler_critic.update()
 
+            # ---------------------
+            # Train Generator (With VGG Perceptual Loss)
+            # ---------------------
             fresh_noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
 
             with torch.amp.autocast('cuda'):
@@ -325,14 +412,21 @@ def train_pipeline():
                 loss_gen = loss_gen_adv + (LAMBDA_PERC * loss_gen_perc)
 
             opt_gen.zero_grad()
-            scaler_gan.scale(loss_gen).backward()
-            scaler_gan.unscale_(opt_gen)
+            scaler_gen.scale(loss_gen).backward()
+            
+            # Clip generator gradients before stepping
+            scaler_gen.unscale_(opt_gen)
             torch.nn.utils.clip_grad_norm_(gen.parameters(), max_norm=GEN_GRAD_CLIP_NORM)
-            scaler_gan.step(opt_gen)
-            scaler_gan.update()
+            
+            scaler_gen.step(opt_gen)
+            scaler_gen.update()
 
+            # --- update EMA generator right after each generator step ---
             update_ema(ema_gen, gen, EMA_DECAY)
 
+            # ---------------------
+            # Train EfficientNet Classifier
+            # ---------------------
             with torch.no_grad():
                 ema_noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
                 ema_fake_imgs = ema_gen(ema_noise, labels)
@@ -349,29 +443,33 @@ def train_pipeline():
             scaler_class.step(opt_class)
             scaler_class.update()
 
+        # --- LR decay step (only once we're past the configured epoch) ---
         if epoch >= LR_DECAY_START_EPOCH:
             sched_gen.step()
             sched_critic.step()
 
+        # --- EPOCH WRAP-UP ---
         print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | "
               f"Gen Adv: {loss_gen_adv.item():.4f} | Gen Perc: {loss_gen_perc.item():.4f} | "
               f"Class Loss: {loss_class.item():.4f} | "
               f"LR(gen/critic): {opt_gen.param_groups[0]['lr']:.2e}/{opt_critic.param_groups[0]['lr']:.2e}")
 
+        # --- per-epoch validation ---
         val_loss, val_acc, val_f1 = run_validation(classifier, val_loader, DEVICE)
         print(f"   ↳ VAL | Loss: {val_loss:.4f} | Accuracy: {val_acc:.4f} | Macro-F1: {val_f1:.4f}")
 
+        # --- periodic FID ---
         if fid_metric is not None and (epoch + 1) % FID_EVERY == 0:
             fid_score = compute_fid(fid_metric, ema_gen, real_ref_imgs, NUM_CLASSES, Z_DIM, DEVICE, FID_NUM_SAMPLES)
             print(f"   ↳ FID (real vs. EMA-generated, n={FID_NUM_SAMPLES}): {fid_score:.2f}")
 
+        # --- SAVE SAMPLE FAKE IMAGES (now from the EMA generator, not the raw noisy one) ---
         ema_gen.eval()
         with torch.no_grad():
             sample_noise = torch.randn(16, Z_DIM, device=DEVICE)
             sample_labels = torch.randint(0, NUM_CLASSES, (16,), device=DEVICE)
             sample_imgs = ema_gen(sample_noise, sample_labels)
-        
-        # REMOVED: ema_gen.train() - Keep in eval mode
+        ema_gen.train()
 
         save_image(
             sample_imgs.detach().cpu(),
@@ -381,6 +479,7 @@ def train_pipeline():
             value_range=(-1, 1)
         )
 
+        # --- SAVE CHECKPOINT AFTER EVERY EPOCH ---
         checkpoint = {
             'epoch': epoch,
             'gen_state': gen.state_dict(),
@@ -394,6 +493,7 @@ def train_pipeline():
             'val_macro_f1': val_f1,
         }
         torch.save(checkpoint, SAVE_CHECKPOINT_PATH)
+
 
 if __name__ == "__main__":
     train_pipeline()
