@@ -1,7 +1,7 @@
 import os
 import copy
 import torch
-import torch._dynamo          # 🚀 ADD THIS LINE TO FIX THE CRASH
+import torch._dynamo          
 import torch.nn as nn
 import torchvision.models as models
 from torchvision.transforms import v2
@@ -19,14 +19,13 @@ import torch.backends.cudnn as cudnn
 cudnn.benchmark = True   
 
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
-# 🚀 OPTIMIZATION 1: Increased batch size for dual T4 GPUs
 BATCH_SIZE = 64      
 Z_DIM = 128
 NUM_CLASSES = 5
 TARGET_EPOCHS = 200
 LAMBDA_GP = 10
-LAMBDA_PERC = 0.5    # Multiplier for VGG Perceptual Loss
-N_CRITIC = 3         # 3 critic updates per 1 generator update
+LAMBDA_PERC = 0.5    
+N_CRITIC = 3         
 
 # Detect if multiple GPUs are available
 NUM_GPUS = torch.cuda.device_count()
@@ -69,18 +68,15 @@ class VGGPerceptualLoss(nn.Module):
             param.requires_grad = False
 
     def forward(self, X, Y):
-        # 1. Map from [-1, 1] to [0, 1]
         X = (X + 1.0) / 2.0
         Y = (Y + 1.0) / 2.0
 
-        # 2. Apply ImageNet Normalization
         mean = torch.tensor([0.485, 0.456, 0.406], device=X.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=X.device).view(1, 3, 1, 1)
         
         X = (X - mean) / std
         Y = (Y - mean) / std
 
-        # 3. Pass through slices
         h_x1 = self.slice1(X)
         h_y1 = self.slice1(Y)
         h_x2 = self.slice2(h_x1)
@@ -100,7 +96,6 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
     with torch.amp.autocast('cuda', enabled=False):
         d_interpolates = critic(interpolates.float(), labels)
         
-        # When using DataParallel, output size might change slightly, ensure it matches ones_like
         gradients = torch.autograd.grad(
             outputs=d_interpolates,
             inputs=interpolates,
@@ -115,7 +110,6 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay):
-    # Handle DataParallel by unwrapping the model if necessary
     ema_model_dict = ema_model.module.state_dict() if isinstance(ema_model, nn.DataParallel) else ema_model.state_dict()
     model_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
     
@@ -135,12 +129,19 @@ def run_validation(classifier, val_loader, device):
     criterion = torch.nn.CrossEntropyLoss()
 
     for imgs, labels in val_loader:
-        # non_blocking=True speeds up transfer if pin_memory=True in DataLoader
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
+        # 1. Map from [-1, 1] to [0, 1]
+        imgs_norm = (imgs + 1.0) / 2.0
+        
+        # 2. Normalize to ImageNet Stats for the Classifier
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        imgs_norm = (imgs_norm - mean) / std
+        
         with torch.amp.autocast('cuda'):
-            logits = classifier(imgs)
+            logits = classifier(imgs_norm)
             loss = criterion(logits, labels)
             
         total_loss += loss.item() * imgs.size(0)
@@ -190,6 +191,14 @@ def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, 
     fid_metric.update(fake_batch, real=False)
     return fid_metric.compute().item()
 
+# Checkpoint extraction helper to safely strip PyTorch 2.0 compile wrappers and DataParallel wrappers
+def get_state_dict(model):
+    if isinstance(model, nn.DataParallel):
+        model = model.module
+    if hasattr(model, '_orig_mod'):
+        model = model._orig_mod
+    return model.state_dict()
+
 classifier_augment = v2.Compose([
     v2.RandomHorizontalFlip(p=0.5),
     v2.RandomVerticalFlip(p=0.5),
@@ -199,11 +208,9 @@ classifier_augment = v2.Compose([
 def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE} (GPUs Available: {NUM_GPUS})")
 
-    # 🚀 OPTIMIZATION 2: Pointing to the high-speed Temp Drive Bypass
     KAGGLE_DATA_PATH = "/kaggle/temp/processed"
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
 
-    # OPTIMIZED: num_workers=4 and pin_memory=True for much faster data loading
     train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
 
@@ -223,7 +230,6 @@ def train_pipeline():
                 break
         real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
 
-    # Initialize Base Models (NOT wrapped in DataParallel yet)
     gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(DEVICE)
     critic = Critic(num_classes=NUM_CLASSES).to(DEVICE)
     classifier = OSCC_Classifier(
@@ -238,14 +244,12 @@ def train_pipeline():
         p.requires_grad = False
     ema_gen.eval()
 
-    # --- CHECKPOINT RESUME LOGIC (CRITICAL FOR MULTI-GPU TRANSITION) ---
+    # --- CHECKPOINT RESUME LOGIC ---
     start_epoch = 0
     if os.path.exists(LOAD_CHECKPOINT_PATH):
         print("🔌 Found existing checkpoint! Resuming training...")
-        # map_location ensures safe loading regardless of device
         checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
         
-        # Load state dicts into the BASE models (before they are wrapped in DataParallel)
         gen.load_state_dict(checkpoint['gen_state'])
         critic.load_state_dict(checkpoint['critic_state'])
         classifier.load_state_dict(checkpoint['class_state'])
@@ -261,16 +265,13 @@ def train_pipeline():
         print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
         ema_gen.load_state_dict(gen.state_dict())
 
-    # 🚀 OPTIMIZATION 3: PyTorch 2.0 Compiler
     if int(torch.__version__.split('.')[0]) >= 2:
         print("⚙️ Compiling models for PyTorch 2.0 speedup...")
-     
         torch._dynamo.config.suppress_errors = True
         
         gen = torch.compile(gen)
         classifier = torch.compile(classifier)
         ema_gen = torch.compile(ema_gen)
-        # Critic left uncompiled due to gradient penalty graph dynamics
 
     # --- MULTI-GPU WRAPPER ---
     if NUM_GPUS > 1:
@@ -283,26 +284,21 @@ def train_pipeline():
     else:
         perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
 
-    # Optimizers (must be linked to models AFTER loading state but BEFORE wrap/compile if using checkpoint optims, 
-    # but strictly speaking PyTorch allows wrapping after initialization)
     opt_gen = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
     opt_critic = optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
     trainable_class_params = filter(lambda p: p.requires_grad, classifier.parameters())
     opt_class = optim.Adam(trainable_class_params, lr=3e-4, weight_decay=CLASS_WEIGHT_DECAY)
 
-    # Resume optimizer states if checkpoint exists
     if os.path.exists(LOAD_CHECKPOINT_PATH):
         opt_gen.load_state_dict(checkpoint['opt_gen_state'])
         opt_critic.load_state_dict(checkpoint['opt_critic_state'])
 
     criterion_class = torch.nn.CrossEntropyLoss()
     
-    # Separated GradScalers
     scaler_gen = torch.amp.GradScaler('cuda')
     scaler_critic = torch.amp.GradScaler('cuda')
     scaler_class = torch.amp.GradScaler('cuda')
 
-    # --- LR SCHEDULER REBUILD ---
     BASE_LR = 1e-4
     for opt in (opt_gen, opt_critic):
         for group in opt.param_groups:
@@ -325,13 +321,12 @@ def train_pipeline():
     print("🔥 Starting Training...")
     for epoch in range(start_epoch, TARGET_EPOCHS):
         for batch_idx, (real_imgs, labels) in enumerate(train_loader):
-            # non_blocking=True for faster data transfer
             real_imgs = real_imgs.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
             cur_batch_size = real_imgs.shape[0]
 
             # ---------------------
-            # Train Critic (N_CRITIC steps)
+            # Train Critic
             # ---------------------
             for _ in range(N_CRITIC):
                 noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
@@ -360,7 +355,6 @@ def train_pipeline():
                 gen_fake = critic(fresh_fake_imgs, labels).reshape(-1)
                 loss_gen_adv = -torch.mean(gen_fake)
                 
-                # Perceptual loss might return a vector with DataParallel, so take the mean
                 loss_gen_perc = perceptual_loss_fn(fresh_fake_imgs, real_imgs).mean()
                 loss_gen = loss_gen_adv + (LAMBDA_PERC * loss_gen_perc)
 
@@ -369,7 +363,6 @@ def train_pipeline():
             
             scaler_gen.unscale_(opt_gen)
             
-            # Handle grad clipping if wrapped in DataParallel
             gen_params = gen.module.parameters() if isinstance(gen, nn.DataParallel) else gen.parameters()
             torch.nn.utils.clip_grad_norm_(gen_params, max_norm=GEN_GRAD_CLIP_NORM)
             
@@ -389,7 +382,16 @@ def train_pipeline():
             with torch.amp.autocast('cuda'):
                 pooled_imgs = torch.cat([aug_real_imgs, ema_fake_imgs], dim=0)
                 pooled_labels = torch.cat([labels, labels], dim=0)
-                preds = classifier(pooled_imgs)
+                
+                # 1. Map from [-1, 1] to [0, 1]
+                pooled_imgs_norm = (pooled_imgs + 1.0) / 2.0
+                
+                # 2. Normalize to ImageNet Stats for the Pre-trained Classifier
+                mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
+                pooled_imgs_norm = (pooled_imgs_norm - mean) / std
+
+                preds = classifier(pooled_imgs_norm)
                 loss_class = criterion_class(preds, pooled_labels)
 
             opt_class.zero_grad()
@@ -426,18 +428,12 @@ def train_pipeline():
             nrow=4, normalize=True, value_range=(-1, 1)
         )
 
-        # Unpack state_dict safely for saving (removes 'module.' prefix)
-        gen_state = gen.module.state_dict() if isinstance(gen, nn.DataParallel) else gen.state_dict()
-        critic_state = critic.module.state_dict() if isinstance(critic, nn.DataParallel) else critic.state_dict()
-        class_state = classifier.module.state_dict() if isinstance(classifier, nn.DataParallel) else classifier.state_dict()
-        ema_gen_state = ema_gen.module.state_dict() if isinstance(ema_gen, nn.DataParallel) else ema_gen.state_dict()
-
         checkpoint = {
             'epoch': epoch,
-            'gen_state': gen_state,
-            'critic_state': critic_state,
-            'class_state': class_state,
-            'ema_gen_state': ema_gen_state,
+            'gen_state': get_state_dict(gen),
+            'critic_state': get_state_dict(critic),
+            'class_state': get_state_dict(classifier),
+            'ema_gen_state': get_state_dict(ema_gen),
             'opt_gen_state': opt_gen.state_dict(),
             'opt_critic_state': opt_critic.state_dict(),
             'opt_class_state': opt_class.state_dict(),
