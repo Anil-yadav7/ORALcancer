@@ -119,6 +119,9 @@ def update_ema(ema_model, model, decay):
 
 @torch.no_grad()
 def run_validation(classifier, val_loader, device):
+    # Bypass DDP: this runs on rank 0 only, so forwarding through the DDP
+    # wrapper here would issue buffer broadcasts other ranks never match.
+    classifier = classifier.module if isinstance(classifier, DDP) else classifier
     classifier.eval()
     all_preds, all_labels = [], []
     total_loss = 0.0
@@ -232,7 +235,13 @@ def train_worker(rank, world_size):
                 collected += imgs.size(0)
                 if collected >= FID_NUM_SAMPLES:
                     break
-            real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
+            if len(ref_imgs_list) == 0:
+                print(f"⚠️  val_loader returned 0 images from '{KAGGLE_DATA_PATH}' (phase='val'). "
+                      f"Skipping FID tracking for this run -- check that your data preprocessing "
+                      f"step ran and populated this path before main() was called.")
+                fid_metric = None
+            else:
+                real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
 
     # 3. Base Models Initialization
     gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(device)
@@ -368,9 +377,10 @@ def train_worker(rank, world_size):
             scaler_gen.step(opt_gen)
             scaler_gen.update()
 
-            # Only Rank 0 manages EMA to avoid redundant overhead
-            if rank == 0:
-                update_ema(ema_gen, gen, EMA_DECAY)
+            # EMA must be updated identically on every rank: gen's DDP-synced weights
+            # are already identical across ranks after backward, so this stays cheap
+            # and in sync everywhere -- and it lets every rank safely use ema_gen below.
+            update_ema(ema_gen, gen, EMA_DECAY)
 
             # ---------------------
             # Train Classifier
@@ -378,11 +388,7 @@ def train_worker(rank, world_size):
             with torch.no_grad():
                 ema_noise = torch.randn(cur_batch_size, Z_DIM, device=device)
                 
-                # Use standard generator on non-0 ranks for pairing data
-                if rank == 0:
-                    ema_fake_imgs = ema_gen(ema_noise, labels)
-                else:
-                    ema_fake_imgs = gen(ema_noise, labels)
+                ema_fake_imgs = ema_gen(ema_noise, labels)
                     
                 aug_real_imgs = classifier_augment(real_imgs)
 
