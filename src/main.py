@@ -275,7 +275,7 @@ def train_worker(rank, world_size):
 
     # 6. Wrap models in DistributedDataParallel
     gen = DDP(gen, device_ids=[rank])
-    critic = DDP(critic, device_ids=[rank], find_unused_parameters=True) 
+    critic = DDP(critic, device_ids=[rank])
     classifier = DDP(classifier, device_ids=[rank])
     perceptual_loss_fn = VGGPerceptualLoss().to(device)
 
