@@ -15,21 +15,23 @@ from classifier import OSCC_Classifier
 from torchvision.utils import save_image
 import torch.backends.cudnn as cudnn
 
+# --- DISTRIBUTED IMPORTS ---
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 # Enable cuDNN auto-tuner for static image sizes
 cudnn.benchmark = True   
 
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
-BATCH_SIZE = 64      
+GLOBAL_BATCH_SIZE = 64      
 Z_DIM = 128
 NUM_CLASSES = 5
 TARGET_EPOCHS = 200
 LAMBDA_GP = 10
 LAMBDA_PERC = 0.5    
 N_CRITIC = 3         
-
-# Detect if multiple GPUs are available
-NUM_GPUS = torch.cuda.device_count()
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- EMA / validation / FID settings ---
 EMA_DECAY = 0.999
@@ -52,38 +54,31 @@ class VGGPerceptualLoss(nn.Module):
     def __init__(self):
         super(VGGPerceptualLoss, self).__init__()
         vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
-
         self.slice1 = nn.Sequential()
         self.slice2 = nn.Sequential()
         self.slice3 = nn.Sequential()
-
         for x in range(4):
             self.slice1.add_module(str(x), vgg[x])
         for x in range(4, 9):
             self.slice2.add_module(str(x), vgg[x])
         for x in range(9, 16):
             self.slice3.add_module(str(x), vgg[x])
-
         for param in self.parameters():
             param.requires_grad = False
 
     def forward(self, X, Y):
         X = (X + 1.0) / 2.0
         Y = (Y + 1.0) / 2.0
-
         mean = torch.tensor([0.485, 0.456, 0.406], device=X.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=X.device).view(1, 3, 1, 1)
-        
         X = (X - mean) / std
         Y = (Y - mean) / std
-
         h_x1 = self.slice1(X)
         h_y1 = self.slice1(Y)
         h_x2 = self.slice2(h_x1)
         h_y2 = self.slice2(h_y1)
         h_x3 = self.slice3(h_x2)
         h_y3 = self.slice3(h_y2)
-
         loss = nn.functional.l1_loss(h_x1, h_y1) + \
                nn.functional.l1_loss(h_x2, h_y2) + \
                nn.functional.l1_loss(h_x3, h_y3)
@@ -92,9 +87,10 @@ class VGGPerceptualLoss(nn.Module):
 def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device):
     alpha = torch.rand((real_samples.size(0), 1, 1, 1), device=device)
     interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
-
     with torch.amp.autocast('cuda', enabled=False):
-        d_interpolates = critic(interpolates.float(), labels)
+        # 🚀 BYPASS DDP: Prevent hook sync issues during autograd.grad
+        critic_model = critic.module if isinstance(critic, DDP) else critic
+        d_interpolates = critic_model(interpolates.float(), labels)
         
         gradients = torch.autograd.grad(
             outputs=d_interpolates,
@@ -104,14 +100,14 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
             retain_graph=True,
             only_inputs=True,
         )[0]
-
     gradients = gradients.view(gradients.size(0), -1)
     return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay):
-    ema_model_dict = ema_model.module.state_dict() if isinstance(ema_model, nn.DataParallel) else ema_model.state_dict()
-    model_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    # DDP unwrap
+    model_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+    ema_model_dict = ema_model.state_dict()
     
     for key in ema_model_dict.keys():
         ema_tensor = ema_model_dict[key]
@@ -131,11 +127,7 @@ def run_validation(classifier, val_loader, device):
     for imgs, labels in val_loader:
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        
-        # 1. Map from [-1, 1] to [0, 1]
         imgs_norm = (imgs + 1.0) / 2.0
-        
-        # 2. Normalize to ImageNet Stats for the Classifier
         mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
         imgs_norm = (imgs_norm - mean) / std
@@ -159,21 +151,18 @@ def build_fid_metric(device):
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
     except ImportError:
-        print("⚠️ torchmetrics not found. Run: pip install torchmetrics[image]")
         return None
     return FrechetInceptionDistance(feature=2048, normalize=False).to(device)
 
 def to_uint8(img_batch):
     img = ((img_batch + 1.0) / 2.0).clamp(0, 1)
-    img = (img * 255).to(torch.uint8)
-    return img
+    return (img * 255).to(torch.uint8)
 
 @torch.no_grad()
 def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, num_samples):
     fid_metric.reset()
     real_batch = to_uint8(real_ref_imgs[:num_samples].to(device))
     fid_metric.update(real_batch, real=True)
-
     ema_gen.eval()
     fake_batches = []
     remaining = num_samples
@@ -186,14 +175,12 @@ def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, 
         fake_batches.append(to_uint8(fakes))
         remaining -= cur
     ema_gen.train()
-
     fake_batch = torch.cat(fake_batches, dim=0)
     fid_metric.update(fake_batch, real=False)
     return fid_metric.compute().item()
 
-# Checkpoint extraction helper to safely strip PyTorch 2.0 compile wrappers and DataParallel wrappers
 def get_state_dict(model):
-    if isinstance(model, nn.DataParallel):
+    if isinstance(model, DDP):
         model = model.module
     if hasattr(model, '_orig_mod'):
         model = model._orig_mod
@@ -205,100 +192,109 @@ classifier_augment = v2.Compose([
     v2.RandomRotation(degrees=15, fill=0.0),
 ])
 
-def train_pipeline():
-    print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE} (GPUs Available: {NUM_GPUS})")
+def train_worker(rank, world_size):
+    """
+    DDP Worker Process. Runs exactly once per GPU.
+    """
+    # 1. Initialize Distributed Process Group
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    if rank == 0:
+        print(f"🚀 Initializing Kaggle Pipeline on {world_size} GPUs using DDP & Compile...")
 
     KAGGLE_DATA_PATH = "/kaggle/temp/processed"
-    print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
-
+    
+    # 2. Setup Distributed Data Loaders
     train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    local_batch_size = GLOBAL_BATCH_SIZE // world_size
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=local_batch_size, 
+        sampler=train_sampler, drop_last=True, num_workers=4, pin_memory=True
+    )
 
     val_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="val")
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-    print(f"📂 Validation set loaded: {len(val_dataset)} images")
+    # Validation usually happens on Rank 0 only to avoid complex metric gathering
+    val_loader = DataLoader(val_dataset, batch_size=local_batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    fid_metric = build_fid_metric(DEVICE)
+    fid_metric = None
     real_ref_imgs = None
-    if fid_metric is not None:
-        ref_imgs_list = []
-        collected = 0
-        for imgs, _ in val_loader:
-            ref_imgs_list.append(imgs)
-            collected += imgs.size(0)
-            if collected >= FID_NUM_SAMPLES:
-                break
-        real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
+    if rank == 0:
+        fid_metric = build_fid_metric(device)
+        if fid_metric is not None:
+            ref_imgs_list = []
+            collected = 0
+            for imgs, _ in val_loader:
+                ref_imgs_list.append(imgs)
+                collected += imgs.size(0)
+                if collected >= FID_NUM_SAMPLES:
+                    break
+            real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
 
-    gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(DEVICE)
-    critic = Critic(num_classes=NUM_CLASSES).to(DEVICE)
+    # 3. Base Models Initialization
+    gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(device)
+    critic = Critic(num_classes=NUM_CLASSES).to(device)
     classifier = OSCC_Classifier(
-        num_classes=NUM_CLASSES,
-        partial_freeze=CLASS_PARTIAL_FREEZE,
-        partial_freeze_ratio=CLASS_PARTIAL_FREEZE_RATIO,
-        dropout_p=CLASS_DROPOUT,
-    ).to(DEVICE)
+        num_classes=NUM_CLASSES, partial_freeze=CLASS_PARTIAL_FREEZE,
+        partial_freeze_ratio=CLASS_PARTIAL_FREEZE_RATIO, dropout_p=CLASS_DROPOUT,
+    ).to(device)
     
-    ema_gen = copy.deepcopy(gen).to(DEVICE)
+    ema_gen = copy.deepcopy(gen).to(device)
     for p in ema_gen.parameters():
         p.requires_grad = False
     ema_gen.eval()
 
-    # --- CHECKPOINT RESUME LOGIC ---
+    # 4. Checkpoint Loading
     start_epoch = 0
+    checkpoint = None
     if os.path.exists(LOAD_CHECKPOINT_PATH):
-        print("🔌 Found existing checkpoint! Resuming training...")
-        checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
-        
+        if rank == 0: print("🔌 Found existing checkpoint! Resuming training...")
+        checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=device, weights_only=True)
         gen.load_state_dict(checkpoint['gen_state'])
         critic.load_state_dict(checkpoint['critic_state'])
         classifier.load_state_dict(checkpoint['class_state'])
-
         if 'ema_gen_state' in checkpoint:
             ema_gen.load_state_dict(checkpoint['ema_gen_state'])
         else:
             ema_gen.load_state_dict(gen.state_dict())
-            
         start_epoch = checkpoint['epoch'] + 1
-        print(f"✅ Successfully loaded state. Starting from Epoch {start_epoch}")
     else:
-        print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
+        if rank == 0: print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
         ema_gen.load_state_dict(gen.state_dict())
 
+    # 5. Compile Models (Safe under DDP!)
     if int(torch.__version__.split('.')[0]) >= 2:
-        print("⚙️ Compiling models for PyTorch 2.0 speedup...")
+        if rank == 0: print("⚙️ Compiling models for PyTorch 2.0 speedup...")
         torch._dynamo.config.suppress_errors = True
-        
         gen = torch.compile(gen)
         classifier = torch.compile(classifier)
         ema_gen = torch.compile(ema_gen)
 
-    # --- MULTI-GPU WRAPPER ---
-    if NUM_GPUS > 1:
-        print(f"🚀 Wrapping models in DataParallel to utilize {NUM_GPUS} GPUs...")
-        gen = nn.DataParallel(gen)
-        critic = nn.DataParallel(critic)
-        classifier = nn.DataParallel(classifier)
-        ema_gen = nn.DataParallel(ema_gen)
-        perceptual_loss_fn = nn.DataParallel(VGGPerceptualLoss().to(DEVICE))
-    else:
-        perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
+    # 6. Wrap models in DistributedDataParallel
+    gen = DDP(gen, device_ids=[rank])
+    critic = DDP(critic, device_ids=[rank], find_unused_parameters=True) 
+    classifier = DDP(classifier, device_ids=[rank])
+    perceptual_loss_fn = VGGPerceptualLoss().to(device)
 
+    # 7. Optimizers & Scalers
     opt_gen = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
     opt_critic = optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
     trainable_class_params = filter(lambda p: p.requires_grad, classifier.parameters())
     opt_class = optim.Adam(trainable_class_params, lr=3e-4, weight_decay=CLASS_WEIGHT_DECAY)
 
-    if os.path.exists(LOAD_CHECKPOINT_PATH):
+    if checkpoint is not None:
         opt_gen.load_state_dict(checkpoint['opt_gen_state'])
         opt_critic.load_state_dict(checkpoint['opt_critic_state'])
 
     criterion_class = torch.nn.CrossEntropyLoss()
-    
     scaler_gen = torch.amp.GradScaler('cuda')
     scaler_critic = torch.amp.GradScaler('cuda')
     scaler_class = torch.amp.GradScaler('cuda')
 
+    # 8. Schedulers
     BASE_LR = 1e-4
     for opt in (opt_gen, opt_critic):
         for group in opt.param_groups:
@@ -307,7 +303,6 @@ def train_pipeline():
 
     decay_span = max(TARGET_EPOCHS - LR_DECAY_START_EPOCH, 1)
     elapsed_decay_epochs = max(start_epoch - LR_DECAY_START_EPOCH, 0)
-
     sched_gen = optim.lr_scheduler.CosineAnnealingLR(opt_gen, T_max=decay_span)
     sched_critic = optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=decay_span)
 
@@ -315,21 +310,23 @@ def train_pipeline():
         sched_gen.step()
         sched_critic.step()
 
-    print(f"🔧 LR schedule rebuilt: base={BASE_LR:.2e}, decay_span={decay_span}, replayed {elapsed_decay_epochs} decay steps.")
-
     # --- TRAINING LOOP ---
-    print("🔥 Starting Training...")
+    if rank == 0: print("🔥 Starting Training...")
+    
     for epoch in range(start_epoch, TARGET_EPOCHS):
+        # CRITICAL: Let the sampler know the current epoch to shuffle properly across GPUs
+        train_sampler.set_epoch(epoch)
+        
         for batch_idx, (real_imgs, labels) in enumerate(train_loader):
-            real_imgs = real_imgs.to(DEVICE, non_blocking=True)
-            labels = labels.to(DEVICE, non_blocking=True)
+            real_imgs = real_imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             cur_batch_size = real_imgs.shape[0]
 
             # ---------------------
             # Train Critic
             # ---------------------
             for _ in range(N_CRITIC):
-                noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
+                noise = torch.randn(cur_batch_size, Z_DIM, device=device)
 
                 with torch.amp.autocast('cuda'):
                     fake_imgs = gen(noise, labels)
@@ -337,7 +334,7 @@ def train_pipeline():
                     critic_fake = critic(fake_imgs.detach(), labels).reshape(-1)
                     loss_critic_base = torch.mean(critic_fake) - torch.mean(critic_real)
 
-                gp = compute_gradient_penalty(critic, real_imgs, fake_imgs.detach(), labels, DEVICE)
+                gp = compute_gradient_penalty(critic, real_imgs, fake_imgs.detach(), labels, device)
                 loss_critic = loss_critic_base + (LAMBDA_GP * gp)
 
                 opt_critic.zero_grad()
@@ -348,11 +345,15 @@ def train_pipeline():
             # ---------------------
             # Train Generator
             # ---------------------
-            fresh_noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
+            fresh_noise = torch.randn(cur_batch_size, Z_DIM, device=device)
 
             with torch.amp.autocast('cuda'):
                 fresh_fake_imgs = gen(fresh_noise, labels)
-                gen_fake = critic(fresh_fake_imgs, labels).reshape(-1)
+                
+                # 🚀 BYPASS DDP: Prevent Critic gradient sync errors on Generator backward pass
+                critic_model = critic.module if isinstance(critic, DDP) else critic
+                gen_fake = critic_model(fresh_fake_imgs, labels).reshape(-1)
+                
                 loss_gen_adv = -torch.mean(gen_fake)
                 
                 loss_gen_perc = perceptual_loss_fn(fresh_fake_imgs, real_imgs).mean()
@@ -360,35 +361,37 @@ def train_pipeline():
 
             opt_gen.zero_grad()
             scaler_gen.scale(loss_gen).backward()
-            
             scaler_gen.unscale_(opt_gen)
             
-            gen_params = gen.module.parameters() if isinstance(gen, nn.DataParallel) else gen.parameters()
-            torch.nn.utils.clip_grad_norm_(gen_params, max_norm=GEN_GRAD_CLIP_NORM)
+            torch.nn.utils.clip_grad_norm_(gen.module.parameters(), max_norm=GEN_GRAD_CLIP_NORM)
             
             scaler_gen.step(opt_gen)
             scaler_gen.update()
 
-            update_ema(ema_gen, gen, EMA_DECAY)
+            # Only Rank 0 manages EMA to avoid redundant overhead
+            if rank == 0:
+                update_ema(ema_gen, gen, EMA_DECAY)
 
             # ---------------------
             # Train Classifier
             # ---------------------
             with torch.no_grad():
-                ema_noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
-                ema_fake_imgs = ema_gen(ema_noise, labels)
+                ema_noise = torch.randn(cur_batch_size, Z_DIM, device=device)
+                
+                # Use standard generator on non-0 ranks for pairing data
+                if rank == 0:
+                    ema_fake_imgs = ema_gen(ema_noise, labels)
+                else:
+                    ema_fake_imgs = gen(ema_noise, labels)
+                    
                 aug_real_imgs = classifier_augment(real_imgs)
 
             with torch.amp.autocast('cuda'):
                 pooled_imgs = torch.cat([aug_real_imgs, ema_fake_imgs], dim=0)
                 pooled_labels = torch.cat([labels, labels], dim=0)
-                
-                # 1. Map from [-1, 1] to [0, 1]
                 pooled_imgs_norm = (pooled_imgs + 1.0) / 2.0
-                
-                # 2. Normalize to ImageNet Stats for the Pre-trained Classifier
-                mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
+                mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
                 pooled_imgs_norm = (pooled_imgs_norm - mean) / std
 
                 preds = classifier(pooled_imgs_norm)
@@ -404,43 +407,61 @@ def train_pipeline():
             sched_gen.step()
             sched_critic.step()
 
-        print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | "
-              f"Gen Adv: {loss_gen_adv.item():.4f} | Gen Perc: {loss_gen_perc.item():.4f} | "
-              f"Class Loss: {loss_class.item():.4f}")
+        # Process Logging and Validation solely on the master node
+        if rank == 0:
+            print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | "
+                  f"Gen Adv: {loss_gen_adv.item():.4f} | Gen Perc: {loss_gen_perc.item():.4f} | "
+                  f"Class Loss: {loss_class.item():.4f}")
 
-        val_loss, val_acc, val_f1 = run_validation(classifier, val_loader, DEVICE)
-        print(f"   ↳ VAL | Loss: {val_loss:.4f} | Accuracy: {val_acc:.4f} | Macro-F1: {val_f1:.4f}")
+            val_loss, val_acc, val_f1 = run_validation(classifier, val_loader, device)
+            print(f"   ↳ VAL | Loss: {val_loss:.4f} | Accuracy: {val_acc:.4f} | Macro-F1: {val_f1:.4f}")
 
-        if fid_metric is not None and (epoch + 1) % FID_EVERY == 0:
-            fid_score = compute_fid(fid_metric, ema_gen, real_ref_imgs, NUM_CLASSES, Z_DIM, DEVICE, FID_NUM_SAMPLES)
-            print(f"   ↳ FID (real vs. EMA-generated, n={FID_NUM_SAMPLES}): {fid_score:.2f}")
+            if fid_metric is not None and (epoch + 1) % FID_EVERY == 0:
+                fid_score = compute_fid(fid_metric, ema_gen, real_ref_imgs, NUM_CLASSES, Z_DIM, device, FID_NUM_SAMPLES)
+                print(f"   ↳ FID (real vs. EMA-generated, n={FID_NUM_SAMPLES}): {fid_score:.2f}")
 
-        ema_gen.eval()
-        with torch.no_grad():
-            sample_noise = torch.randn(16, Z_DIM, device=DEVICE)
-            sample_labels = torch.randint(0, NUM_CLASSES, (16,), device=DEVICE)
-            sample_imgs = ema_gen(sample_noise, sample_labels)
-        ema_gen.train()
+            ema_gen.eval()
+            with torch.no_grad():
+                sample_noise = torch.randn(16, Z_DIM, device=device)
+                sample_labels = torch.randint(0, NUM_CLASSES, (16,), device=device)
+                sample_imgs = ema_gen(sample_noise, sample_labels)
+            ema_gen.train()
 
-        save_image(
-            sample_imgs.detach().cpu(),
-            f"/kaggle/working/fake_samples_epoch_{epoch+1}.png",
-            nrow=4, normalize=True, value_range=(-1, 1)
-        )
+            save_image(
+                sample_imgs.detach().cpu(),
+                f"/kaggle/working/fake_samples_epoch_{epoch+1}.png",
+                nrow=4, normalize=True, value_range=(-1, 1)
+            )
 
-        checkpoint = {
-            'epoch': epoch,
-            'gen_state': get_state_dict(gen),
-            'critic_state': get_state_dict(critic),
-            'class_state': get_state_dict(classifier),
-            'ema_gen_state': get_state_dict(ema_gen),
-            'opt_gen_state': opt_gen.state_dict(),
-            'opt_critic_state': opt_critic.state_dict(),
-            'opt_class_state': opt_class.state_dict(),
-            'val_acc': val_acc,
-            'val_macro_f1': val_f1,
-        }
-        torch.save(checkpoint, SAVE_CHECKPOINT_PATH)
+            checkpoint_dict = {
+                'epoch': epoch,
+                'gen_state': get_state_dict(gen),
+                'critic_state': get_state_dict(critic),
+                'class_state': get_state_dict(classifier),
+                'ema_gen_state': get_state_dict(ema_gen),
+                'opt_gen_state': opt_gen.state_dict(),
+                'opt_critic_state': opt_critic.state_dict(),
+                'opt_class_state': opt_class.state_dict(),
+                'val_acc': val_acc,
+                'val_macro_f1': val_f1,
+            }
+            torch.save(checkpoint_dict, SAVE_CHECKPOINT_PATH)
+
+    dist.destroy_process_group()
+
+def main():
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        print("⚠️ Only 1 GPU detected. Running strictly on Single GPU pipeline.")
+        # Setup standalone environment variables to satisfy DDP initialization on single-GPU
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        train_worker(0, 1)
+    else:
+        # Spawn DDP processes for Dual T4 / Multi-GPU set up
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        mp.spawn(train_worker, args=(world_size,), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
-    train_pipeline()
+    main()
