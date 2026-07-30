@@ -16,8 +16,10 @@ import torch.backends.cudnn as cudnn
 
 # Enable cuDNN auto-tuner for static image sizes
 cudnn.benchmark = True   
+
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
-BATCH_SIZE = 32      # With DataParallel, this batch of 32 will be split: 16 to GPU 0, 16 to GPU 1
+# 🚀 OPTIMIZATION 1: Increased batch size for dual T4 GPUs
+BATCH_SIZE = 64      
 Z_DIM = 128
 NUM_CLASSES = 5
 TARGET_EPOCHS = 200
@@ -31,7 +33,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- EMA / validation / FID settings ---
 EMA_DECAY = 0.999
-FID_EVERY = 20               # UPDATED FOR SPEED: Compute FID every 20 epochs instead of 5
+FID_EVERY = 20               
 FID_NUM_SAMPLES = 300
 LR_DECAY_START_EPOCH = 100
 GEN_GRAD_CLIP_NORM = 5.0
@@ -196,7 +198,8 @@ classifier_augment = v2.Compose([
 def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE} (GPUs Available: {NUM_GPUS})")
 
-    KAGGLE_DATA_PATH = "/kaggle/input/datasets/anil701/oraldataset/processed"
+    # 🚀 OPTIMIZATION 2: Pointing to the high-speed Temp Drive Bypass
+    KAGGLE_DATA_PATH = "/kaggle/temp/processed"
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
 
     # OPTIMIZED: num_workers=4 and pin_memory=True for much faster data loading
@@ -234,22 +237,8 @@ def train_pipeline():
         p.requires_grad = False
     ema_gen.eval()
 
-    # Optimizers (must be linked to base models before wrapping in DataParallel)
-    opt_gen = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
-    opt_critic = optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
-    trainable_class_params = filter(lambda p: p.requires_grad, classifier.parameters())
-    opt_class = optim.Adam(trainable_class_params, lr=3e-4, weight_decay=CLASS_WEIGHT_DECAY)
-
-    criterion_class = torch.nn.CrossEntropyLoss()
-    
-    # Separated GradScalers
-    scaler_gen = torch.amp.GradScaler('cuda')
-    scaler_critic = torch.amp.GradScaler('cuda')
-    scaler_class = torch.amp.GradScaler('cuda')
-
-    start_epoch = 0
-
     # --- CHECKPOINT RESUME LOGIC (CRITICAL FOR MULTI-GPU TRANSITION) ---
+    start_epoch = 0
     if os.path.exists(LOAD_CHECKPOINT_PATH):
         print("🔌 Found existing checkpoint! Resuming training...")
         # map_location ensures safe loading regardless of device
@@ -259,8 +248,6 @@ def train_pipeline():
         gen.load_state_dict(checkpoint['gen_state'])
         critic.load_state_dict(checkpoint['critic_state'])
         classifier.load_state_dict(checkpoint['class_state'])
-        opt_gen.load_state_dict(checkpoint['opt_gen_state'])
-        opt_critic.load_state_dict(checkpoint['opt_critic_state'])
 
         if 'ema_gen_state' in checkpoint:
             ema_gen.load_state_dict(checkpoint['ema_gen_state'])
@@ -272,7 +259,18 @@ def train_pipeline():
     else:
         print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
         ema_gen.load_state_dict(gen.state_dict())
+
+    # 🚀 OPTIMIZATION 3: PyTorch 2.0 Compiler
+    if int(torch.__version__.split('.')[0]) >= 2:
+        print("⚙️ Compiling models for PyTorch 2.0 speedup...")
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
         
+        gen = torch.compile(gen)
+        classifier = torch.compile(classifier)
+        ema_gen = torch.compile(ema_gen)
+        # Critic left uncompiled due to gradient penalty graph dynamics
+
     # --- MULTI-GPU WRAPPER ---
     if NUM_GPUS > 1:
         print(f"🚀 Wrapping models in DataParallel to utilize {NUM_GPUS} GPUs...")
@@ -283,6 +281,25 @@ def train_pipeline():
         perceptual_loss_fn = nn.DataParallel(VGGPerceptualLoss().to(DEVICE))
     else:
         perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
+
+    # Optimizers (must be linked to models AFTER loading state but BEFORE wrap/compile if using checkpoint optims, 
+    # but strictly speaking PyTorch allows wrapping after initialization)
+    opt_gen = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
+    opt_critic = optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
+    trainable_class_params = filter(lambda p: p.requires_grad, classifier.parameters())
+    opt_class = optim.Adam(trainable_class_params, lr=3e-4, weight_decay=CLASS_WEIGHT_DECAY)
+
+    # Resume optimizer states if checkpoint exists
+    if os.path.exists(LOAD_CHECKPOINT_PATH):
+        opt_gen.load_state_dict(checkpoint['opt_gen_state'])
+        opt_critic.load_state_dict(checkpoint['opt_critic_state'])
+
+    criterion_class = torch.nn.CrossEntropyLoss()
+    
+    # Separated GradScalers
+    scaler_gen = torch.amp.GradScaler('cuda')
+    scaler_critic = torch.amp.GradScaler('cuda')
+    scaler_class = torch.amp.GradScaler('cuda')
 
     # --- LR SCHEDULER REBUILD ---
     BASE_LR = 1e-4
