@@ -264,7 +264,7 @@ def train_pipeline():
     # 🚀 OPTIMIZATION 3: PyTorch 2.0 Compiler
     if int(torch.__version__.split('.')[0]) >= 2:
         print("⚙️ Compiling models for PyTorch 2.0 speedup...")
-        import torch._dynamo
+     
         torch._dynamo.config.suppress_errors = True
         
         gen = torch.compile(gen)
