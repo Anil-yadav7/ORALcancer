@@ -196,7 +196,7 @@ classifier_augment = v2.Compose([
 def train_pipeline():
     print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE} (GPUs Available: {NUM_GPUS})")
 
-    KAGGLE_DATA_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/oral-processed/processed"
+    KAGGLE_DATA_PATH = "/kaggle/input/datasets/anil701/oraldataset/processed"
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
 
     # OPTIMIZED: num_workers=4 and pin_memory=True for much faster data loading
