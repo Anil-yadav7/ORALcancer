@@ -15,7 +15,7 @@ from torchvision.utils import save_image
 import torch.backends.cudnn as cudnn
 
 # Enable cuDNN auto-tuner for static image sizes
-cudnn.benchmark = True
+cudnn.benchmark = True   
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
 BATCH_SIZE = 32      # With DataParallel, this batch of 32 will be split: 16 to GPU 0, 16 to GPU 1
 Z_DIM = 128
