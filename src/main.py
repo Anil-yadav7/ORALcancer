@@ -14,38 +14,33 @@ from classifier import OSCC_Classifier
 from torchvision.utils import save_image
 
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
-BATCH_SIZE = 32
+BATCH_SIZE = 32      # With DataParallel, this batch of 32 will be split: 16 to GPU 0, 16 to GPU 1
 Z_DIM = 128
 NUM_CLASSES = 5
-TARGET_EPOCHS = 200          # synced to the fresh run currently in progress
+TARGET_EPOCHS = 200
 LAMBDA_GP = 10
 LAMBDA_PERC = 0.5    # Multiplier for VGG Perceptual Loss
-N_CRITIC = 3   # NEW: was 5. FID plateaued ~epoch 20-44 (160-169 band) with Critic Loss
-               # swinging widely (-4.7 to -75) — the critic getting 5 updates per 1
-               # generator update looks like it's outpacing the generator enough to
-               # stall its progress. Dropping to 3:1 gives the generator relatively
-               # more influence per critic update, without abandoning WGAN-GP's need
-               # for a well-trained critic entirely.
+N_CRITIC = 3         # 3 critic updates per 1 generator update
+
+# Detect if multiple GPUs are available
+NUM_GPUS = torch.cuda.device_count()
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- NEW: EMA / validation / FID settings ---
-EMA_DECAY = 0.999          # Standard GAN EMA decay; higher = smoother/slower-following
-FID_EVERY = 5               # Compute FID every N epochs (it's expensive, don't run every epoch)
-FID_NUM_SAMPLES = 300        # How many real/fake images to compare for FID
-LR_DECAY_START_EPOCH = 100   # Cosine decay kicks in after this epoch (absolute epoch count)
-GEN_GRAD_CLIP_NORM = 5.0     # NEW: clip generator gradient norm to curb large destabilizing steps
+# --- EMA / validation / FID settings ---
+EMA_DECAY = 0.999
+FID_EVERY = 20               # UPDATED FOR SPEED: Compute FID every 20 epochs instead of 5
+FID_NUM_SAMPLES = 300
+LR_DECAY_START_EPOCH = 100
+GEN_GRAD_CLIP_NORM = 5.0
 
-# --- NEW: classifier overfitting fixes ---
-# Val accuracy plateaued at ~0.60-0.63 while train Class Loss collapsed to ~0.0002 —
-# a clear overfitting signature on the ~150-patient cohort. These settings address it.
+# --- classifier overfitting fixes ---
 CLASS_DROPOUT = 0.5
 CLASS_WEIGHT_DECAY = 1e-4
 CLASS_PARTIAL_FREEZE = True
-CLASS_PARTIAL_FREEZE_RATIO = 0.7   # freeze earliest 70% of EfficientNet feature blocks
+CLASS_PARTIAL_FREEZE_RATIO = 0.7
 
-LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/anil701/oraldata/oscc_checkpoint.bin"
+LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/checkpoint145/oscc_checkpoint.bin"
 SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
-
 
 # --- VGG PERCEPTUAL LOSS MODULE ---
 class VGGPerceptualLoss(nn.Module):
@@ -72,7 +67,7 @@ class VGGPerceptualLoss(nn.Module):
         X = (X + 1.0) / 2.0
         Y = (Y + 1.0) / 2.0
 
-        # 2. Apply ImageNet Normalization (expected by VGG16 weights)
+        # 2. Apply ImageNet Normalization
         mean = torch.tensor([0.485, 0.456, 0.406], device=X.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=X.device).view(1, 3, 1, 1)
         
@@ -92,14 +87,14 @@ class VGGPerceptualLoss(nn.Module):
                nn.functional.l1_loss(h_x3, h_y3)
         return loss
 
-
 def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device):
     alpha = torch.rand((real_samples.size(0), 1, 1, 1), device=device)
     interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
 
     with torch.amp.autocast('cuda', enabled=False):
         d_interpolates = critic(interpolates.float(), labels)
-
+        
+        # When using DataParallel, output size might change slightly, ensure it matches ones_like
         gradients = torch.autograd.grad(
             outputs=d_interpolates,
             inputs=interpolates,
@@ -112,27 +107,20 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
     gradients = gradients.view(gradients.size(0), -1)
     return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
-
-# --- NEW: EMA helper ---
 @torch.no_grad()
 def update_ema(ema_model, model, decay):
-    """
-    Exponential moving average update over the FULL state_dict (params + buffers,
-    e.g. BatchNorm running_mean/running_var). Non-floating buffers (like
-    num_batches_tracked) are copied directly rather than averaged.
-    """
-    ema_state = ema_model.state_dict()
-    model_state = model.state_dict()
-    for key in ema_state.keys():
-        ema_tensor = ema_state[key]
-        model_tensor = model_state[key]
+    # Handle DataParallel by unwrapping the model if necessary
+    ema_model_dict = ema_model.module.state_dict() if isinstance(ema_model, nn.DataParallel) else ema_model.state_dict()
+    model_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    
+    for key in ema_model_dict.keys():
+        ema_tensor = ema_model_dict[key]
+        model_tensor = model_dict[key]
         if ema_tensor.dtype.is_floating_point:
             ema_tensor.mul_(decay).add_(model_tensor, alpha=1 - decay)
         else:
             ema_tensor.copy_(model_tensor)
 
-
-# --- NEW: classifier validation loop ---
 @torch.no_grad()
 def run_validation(classifier, val_loader, device):
     classifier.eval()
@@ -141,10 +129,14 @@ def run_validation(classifier, val_loader, device):
     criterion = torch.nn.CrossEntropyLoss()
 
     for imgs, labels in val_loader:
-        imgs, labels = imgs.to(device), labels.to(device)
+        # non_blocking=True speeds up transfer if pin_memory=True in DataLoader
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        
         with torch.amp.autocast('cuda'):
             logits = classifier(imgs)
             loss = criterion(logits, labels)
+            
         total_loss += loss.item() * imgs.size(0)
         preds = logits.argmax(dim=1).cpu().numpy()
         all_preds.extend(preds)
@@ -156,29 +148,22 @@ def run_validation(classifier, val_loader, device):
     macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     return avg_loss, acc, macro_f1
 
-
-# --- NEW: FID tracking (uses torchmetrics; pip install torchmetrics[image] if missing) ---
 def build_fid_metric(device):
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
     except ImportError:
         print("⚠️ torchmetrics not found. Run: pip install torchmetrics[image]")
         return None
-    # normalize=False -> expects uint8 images in [0, 255]
     return FrechetInceptionDistance(feature=2048, normalize=False).to(device)
 
-
 def to_uint8(img_batch):
-    """Converts a [-1, 1] float tensor batch to uint8 [0, 255], 3-channel."""
     img = ((img_batch + 1.0) / 2.0).clamp(0, 1)
     img = (img * 255).to(torch.uint8)
     return img
 
-
 @torch.no_grad()
 def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, num_samples):
     fid_metric.reset()
-
     real_batch = to_uint8(real_ref_imgs[:num_samples].to(device))
     fid_metric.update(real_batch, real=True)
 
@@ -197,50 +182,28 @@ def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, 
 
     fake_batch = torch.cat(fake_batches, dim=0)
     fid_metric.update(fake_batch, real=False)
-
     return fid_metric.compute().item()
 
-
-# --- NEW: classifier-only augmentation, applied directly to already-loaded tensors.
-# This runs ONLY on the copy fed to the classifier, never on the real_imgs used by
-# the critic/generator — keeping the GAN's view of "real" completely clean.
-# Operates in the [-1, 1] normalized tensor space (post ReinhardNormalizer +
-# ToTensor + Normalize), so any rotation gap is filled with 0.0 here, which
-# corresponds to mid-gray in pixel space — NOT black — avoiding the artifact issue
-# that affected the GAN when augmentation lived in the shared dataset transform.
 classifier_augment = v2.Compose([
     v2.RandomHorizontalFlip(p=0.5),
     v2.RandomVerticalFlip(p=0.5),
     v2.RandomRotation(degrees=15, fill=0.0),
 ])
 
-
 def train_pipeline():
-    print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE}")
+    print(f"🚀 Initializing Kaggle Pipeline on: {DEVICE} (GPUs Available: {NUM_GPUS})")
 
-    # 1. Load Data
-    KAGGLE_DATA_PATH = "/kaggle/input/datasets/anil701/oraldataset/processed"
-
+    KAGGLE_DATA_PATH = "/kaggle/input/datasets/chakkilalaanilkumar/oral-processed/processed"
     print(f"📂 Loading dataset from: {KAGGLE_DATA_PATH}")
 
-    # NOTE: train_dataset now uses the dataset's DEFAULT (unaugmented) transform.
-    # Augmentation moved to a separate, tensor-space step applied ONLY to the
-    # classifier's real-image branch inside the training loop (see
-    # `classifier_augment` below). Previously, flip/rotation augmentation was baked
-    # into this dataset's transform, which meant the CRITIC also saw augmented reals —
-    # RandomRotation's default black-corner fill gave the critic a trivial artifact to
-    # key on (real images had black wedges, generator output never did), which is the
-    # likely cause of the FID regression (173 -> 218) and widened loss swings in the
-    # last run. Keeping this dataset clean fixes that at the source.
+    # OPTIMIZED: num_workers=4 and pin_memory=True for much faster data loading
     train_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="train")
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
 
-    # --- NEW: validation set ---
     val_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="val")
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     print(f"📂 Validation set loaded: {len(val_dataset)} images")
 
-    # --- NEW: fixed reference batch of real images for FID (consistent across epochs) ---
     fid_metric = build_fid_metric(DEVICE)
     real_ref_imgs = None
     if fid_metric is not None:
@@ -253,7 +216,7 @@ def train_pipeline():
                 break
         real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
 
-    # 2. Initialize Models
+    # Initialize Base Models (NOT wrapped in DataParallel yet)
     gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(DEVICE)
     critic = Critic(num_classes=NUM_CLASSES).to(DEVICE)
     classifier = OSCC_Classifier(
@@ -262,88 +225,63 @@ def train_pipeline():
         partial_freeze_ratio=CLASS_PARTIAL_FREEZE_RATIO,
         dropout_p=CLASS_DROPOUT,
     ).to(DEVICE)
-    perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
-
-    # --- NEW: EMA generator (a smoothed shadow copy, used for sampling/FID/classifier data) ---
+    
     ema_gen = copy.deepcopy(gen).to(DEVICE)
     for p in ema_gen.parameters():
         p.requires_grad = False
     ema_gen.eval()
 
-    # 3. Optimizers
+    # Optimizers (must be linked to base models before wrapping in DataParallel)
     opt_gen = optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
     opt_critic = optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
-    # NEW: only pass trainable (non-frozen) params to the optimizer, and add weight
-    # decay — the previous opt_class had no regularization at all, which combined
-    # with full end-to-end fine-tuning on ~150 patients is a big part of why train
-    # loss collapsed to ~0.0002 while val accuracy sat flat at ~0.60-0.63.
     trainable_class_params = filter(lambda p: p.requires_grad, classifier.parameters())
     opt_class = optim.Adam(trainable_class_params, lr=3e-4, weight_decay=CLASS_WEIGHT_DECAY)
 
     criterion_class = torch.nn.CrossEntropyLoss()
     
-    # --- UPDATED: Separated GradScalers to prevent inf/NaN gradient collisions ---
+    # Separated GradScalers
     scaler_gen = torch.amp.GradScaler('cuda')
     scaler_critic = torch.amp.GradScaler('cuda')
     scaler_class = torch.amp.GradScaler('cuda')
 
     start_epoch = 0
 
-    # --- CHECKPOINT RESUME LOGIC ---
+    # --- CHECKPOINT RESUME LOGIC (CRITICAL FOR MULTI-GPU TRANSITION) ---
     if os.path.exists(LOAD_CHECKPOINT_PATH):
         print("🔌 Found existing checkpoint! Resuming training...")
-        checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=DEVICE)
+        # map_location ensures safe loading regardless of device
+        checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
+        
+        # Load state dicts into the BASE models (before they are wrapped in DataParallel)
         gen.load_state_dict(checkpoint['gen_state'])
         critic.load_state_dict(checkpoint['critic_state'])
         classifier.load_state_dict(checkpoint['class_state'])
         opt_gen.load_state_dict(checkpoint['opt_gen_state'])
         opt_critic.load_state_dict(checkpoint['opt_critic_state'])
 
-        # NEW: opt_class is intentionally NOT restored from the checkpoint. Partial
-        # freezing changed which parameters are trainable, so the old optimizer
-        # state (sized for the previous, fully-trainable parameter set) is no longer
-        # compatible and would raise a size-mismatch error if loaded. This only
-        # resets classifier optimizer momentum — the classifier's LEARNED WEIGHTS
-        # still load normally below via classifier.load_state_dict(), and the GAN
-        # (gen/critic/ema_gen) is fully restored. Adam's momentum re-warms up within
-        # a handful of steps, so this is a minor, contained reset — not a restart.
-        print("ℹ️ Classifier optimizer reset (partial-freeze changes trainable params) — "
-              "generator, critic, EMA generator, and classifier weights all restored normally.")
-        start_epoch = checkpoint['epoch'] + 1
-
-        # NEW: EMA state may not exist in old checkpoints (e.g. your epoch-145 one).
-        # If missing, bootstrap EMA weights from the current generator instead of
-        # crashing or silently starting EMA from random init.
         if 'ema_gen_state' in checkpoint:
             ema_gen.load_state_dict(checkpoint['ema_gen_state'])
-            print("✅ Restored EMA generator from checkpoint.")
         else:
             ema_gen.load_state_dict(gen.state_dict())
-            print("ℹ️ No EMA weights found in checkpoint — bootstrapping EMA from current generator.")
-
-        print(f"✅ Successfully loaded state. Starting from Epoch {start_epoch + 1}")
+            
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"✅ Successfully loaded state. Starting from Epoch {start_epoch}")
     else:
         print("🌱 No checkpoint found. Starting fresh from Epoch 1.")
         ema_gen.load_state_dict(gen.state_dict())
+        
+    # --- MULTI-GPU WRAPPER ---
+    if NUM_GPUS > 1:
+        print(f"🚀 Wrapping models in DataParallel to utilize {NUM_GPUS} GPUs...")
+        gen = nn.DataParallel(gen)
+        critic = nn.DataParallel(critic)
+        classifier = nn.DataParallel(classifier)
+        ema_gen = nn.DataParallel(ema_gen)
+        perceptual_loss_fn = nn.DataParallel(VGGPerceptualLoss().to(DEVICE))
+    else:
+        perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
 
-    # --- FIXED (v2): the previous fix constructed CosineAnnealingLR directly at
-    # last_epoch=N on resume. That doesn't work correctly: PyTorch's
-    # CosineAnnealingLR computes lr via a step-by-step RECURRENCE that depends on
-    # whatever `lr` is CURRENTLY sitting in the optimizer at each .step() call — it
-    # is not a pure function of epoch number. Since opt_gen_state/opt_critic_state
-    # were just loaded from a checkpoint whose lr had already decayed to 0.0 (from
-    # the earlier buggy short-T_max run), constructing the scheduler at
-    # last_epoch=55 silently reused that stale 0.0 instead of recomputing from the
-    # true base lr — which is exactly why every epoch from 146 through 167 in your
-    # logs shows LR(gen/critic): 0.00e+00. The GAN has effectively been frozen
-    # (zero-magnitude weight updates) that whole time, while ema_gen kept drifting
-    # toward that one frozen, mediocre snapshot instead of a real trajectory —
-    # which is why FID kept climbing (218 -> 236 -> 244) instead of holding steady.
-    #
-    # Fix: explicitly reset lr/initial_lr to the true base value (ignore whatever
-    # the checkpoint has), construct the scheduler fresh at last_epoch=-1, then
-    # REPLAY the correct number of .step() calls so the recurrence is walked
-    # through properly instead of jumped to directly.
+    # --- LR SCHEDULER REBUILD ---
     BASE_LR = 1e-4
     for opt in (opt_gen, opt_critic):
         for group in opt.param_groups:
@@ -360,24 +298,19 @@ def train_pipeline():
         sched_gen.step()
         sched_critic.step()
 
-    print(f"🔧 LR schedule rebuilt: base={BASE_LR:.2e}, decay_span={decay_span}, "
-          f"replayed {elapsed_decay_epochs} decay step(s) -> "
-          f"current LR(gen/critic)={opt_gen.param_groups[0]['lr']:.2e}/{opt_critic.param_groups[0]['lr']:.2e}")
-    # CAVEAT: this still only works correctly if TARGET_EPOCHS stays the same value
-    # (200, your fresh run's target) across every Kaggle session from now on — if it
-    # keeps changing between resumes, decay_span changes with it. Keep
-    # TARGET_EPOCHS = 200 fixed going forward; the script will still stop naturally
-    # once `epoch` reaches it.
+    print(f"🔧 LR schedule rebuilt: base={BASE_LR:.2e}, decay_span={decay_span}, replayed {elapsed_decay_epochs} decay steps.")
 
     # --- TRAINING LOOP ---
     print("🔥 Starting Training...")
     for epoch in range(start_epoch, TARGET_EPOCHS):
         for batch_idx, (real_imgs, labels) in enumerate(train_loader):
-            real_imgs, labels = real_imgs.to(DEVICE), labels.to(DEVICE)
+            # non_blocking=True for faster data transfer
+            real_imgs = real_imgs.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
             cur_batch_size = real_imgs.shape[0]
 
             # ---------------------
-            # Train Critic (N_CRITIC steps per generator step)
+            # Train Critic (N_CRITIC steps)
             # ---------------------
             for _ in range(N_CRITIC):
                 noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
@@ -397,35 +330,35 @@ def train_pipeline():
                 scaler_critic.update()
 
             # ---------------------
-            # Train Generator (With VGG Perceptual Loss)
+            # Train Generator
             # ---------------------
             fresh_noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
 
             with torch.amp.autocast('cuda'):
                 fresh_fake_imgs = gen(fresh_noise, labels)
-
                 gen_fake = critic(fresh_fake_imgs, labels).reshape(-1)
                 loss_gen_adv = -torch.mean(gen_fake)
-
-                loss_gen_perc = perceptual_loss_fn(fresh_fake_imgs, real_imgs)
-
+                
+                # Perceptual loss might return a vector with DataParallel, so take the mean
+                loss_gen_perc = perceptual_loss_fn(fresh_fake_imgs, real_imgs).mean()
                 loss_gen = loss_gen_adv + (LAMBDA_PERC * loss_gen_perc)
 
             opt_gen.zero_grad()
             scaler_gen.scale(loss_gen).backward()
             
-            # Clip generator gradients before stepping
             scaler_gen.unscale_(opt_gen)
-            torch.nn.utils.clip_grad_norm_(gen.parameters(), max_norm=GEN_GRAD_CLIP_NORM)
+            
+            # Handle grad clipping if wrapped in DataParallel
+            gen_params = gen.module.parameters() if isinstance(gen, nn.DataParallel) else gen.parameters()
+            torch.nn.utils.clip_grad_norm_(gen_params, max_norm=GEN_GRAD_CLIP_NORM)
             
             scaler_gen.step(opt_gen)
             scaler_gen.update()
 
-            # --- update EMA generator right after each generator step ---
             update_ema(ema_gen, gen, EMA_DECAY)
 
             # ---------------------
-            # Train EfficientNet Classifier
+            # Train Classifier
             # ---------------------
             with torch.no_grad():
                 ema_noise = torch.randn(cur_batch_size, Z_DIM, device=DEVICE)
@@ -443,27 +376,22 @@ def train_pipeline():
             scaler_class.step(opt_class)
             scaler_class.update()
 
-        # --- LR decay step (only once we're past the configured epoch) ---
+        # --- Epoch Wrap-Up ---
         if epoch >= LR_DECAY_START_EPOCH:
             sched_gen.step()
             sched_critic.step()
 
-        # --- EPOCH WRAP-UP ---
         print(f"Epoch [{epoch+1}/{TARGET_EPOCHS}] | Critic Loss: {loss_critic.item():.4f} | "
               f"Gen Adv: {loss_gen_adv.item():.4f} | Gen Perc: {loss_gen_perc.item():.4f} | "
-              f"Class Loss: {loss_class.item():.4f} | "
-              f"LR(gen/critic): {opt_gen.param_groups[0]['lr']:.2e}/{opt_critic.param_groups[0]['lr']:.2e}")
+              f"Class Loss: {loss_class.item():.4f}")
 
-        # --- per-epoch validation ---
         val_loss, val_acc, val_f1 = run_validation(classifier, val_loader, DEVICE)
         print(f"   ↳ VAL | Loss: {val_loss:.4f} | Accuracy: {val_acc:.4f} | Macro-F1: {val_f1:.4f}")
 
-        # --- periodic FID ---
         if fid_metric is not None and (epoch + 1) % FID_EVERY == 0:
             fid_score = compute_fid(fid_metric, ema_gen, real_ref_imgs, NUM_CLASSES, Z_DIM, DEVICE, FID_NUM_SAMPLES)
             print(f"   ↳ FID (real vs. EMA-generated, n={FID_NUM_SAMPLES}): {fid_score:.2f}")
 
-        # --- SAVE SAMPLE FAKE IMAGES (now from the EMA generator, not the raw noisy one) ---
         ema_gen.eval()
         with torch.no_grad():
             sample_noise = torch.randn(16, Z_DIM, device=DEVICE)
@@ -474,18 +402,21 @@ def train_pipeline():
         save_image(
             sample_imgs.detach().cpu(),
             f"/kaggle/working/fake_samples_epoch_{epoch+1}.png",
-            nrow=4,
-            normalize=True,
-            value_range=(-1, 1)
+            nrow=4, normalize=True, value_range=(-1, 1)
         )
 
-        # --- SAVE CHECKPOINT AFTER EVERY EPOCH ---
+        # Unpack state_dict safely for saving (removes 'module.' prefix)
+        gen_state = gen.module.state_dict() if isinstance(gen, nn.DataParallel) else gen.state_dict()
+        critic_state = critic.module.state_dict() if isinstance(critic, nn.DataParallel) else critic.state_dict()
+        class_state = classifier.module.state_dict() if isinstance(classifier, nn.DataParallel) else classifier.state_dict()
+        ema_gen_state = ema_gen.module.state_dict() if isinstance(ema_gen, nn.DataParallel) else ema_gen.state_dict()
+
         checkpoint = {
             'epoch': epoch,
-            'gen_state': gen.state_dict(),
-            'critic_state': critic.state_dict(),
-            'class_state': classifier.state_dict(),
-            'ema_gen_state': ema_gen.state_dict(),
+            'gen_state': gen_state,
+            'critic_state': critic_state,
+            'class_state': class_state,
+            'ema_gen_state': ema_gen_state,
             'opt_gen_state': opt_gen.state_dict(),
             'opt_critic_state': opt_critic.state_dict(),
             'opt_class_state': opt_class.state_dict(),
@@ -493,7 +424,6 @@ def train_pipeline():
             'val_macro_f1': val_f1,
         }
         torch.save(checkpoint, SAVE_CHECKPOINT_PATH)
-
 
 if __name__ == "__main__":
     train_pipeline()
