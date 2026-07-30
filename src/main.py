@@ -6,10 +6,8 @@ import torch.nn as nn
 import torchvision.models as models
 from torchvision.transforms import v2
 import torch.optim as optim
-import torchvision.models as models
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.transforms import v2
 from sklearn.metrics import accuracy_score, f1_score
 from dataset import OSCCDataset
 from gan_model import Generator, Critic
