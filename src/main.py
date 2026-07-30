@@ -1,7 +1,10 @@
 import os
 import copy
 import torch
+import torch._dynamo          # 🚀 ADD THIS LINE TO FIX THE CRASH
 import torch.nn as nn
+import torchvision.models as models
+from torchvision.transforms import v2
 import torch.optim as optim
 import torchvision.models as models
 from torch.utils.data import DataLoader
