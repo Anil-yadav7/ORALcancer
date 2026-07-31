@@ -107,18 +107,20 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay):
-    # 🚀 ROBUST UNWRAPPING: Utilize state dict helper to bypass DDP and torch.compile wrapper mismatches
-    model_dict = get_state_dict(model)
-    ema_model_dict = get_state_dict(ema_model)
+    # 🚀 SPEED FIX: Avoid state_dict() dictionary creation overhead
+    model_mod = model.module if isinstance(model, DDP) else model
     
-    for key in ema_model_dict.keys():
-        ema_tensor = ema_model_dict[key]
-        model_tensor = model_dict[key]
-        if ema_tensor.dtype.is_floating_point:
-            ema_tensor.mul_(decay).add_(model_tensor, alpha=1 - decay)
+    for ema_param, model_param in zip(ema_model.parameters(), model_mod.parameters()):
+        if ema_param.dtype.is_floating_point:
+            ema_param.mul_(decay).add_(model_param, alpha=1 - decay)
         else:
-            ema_tensor.copy_(model_tensor)
-
+            ema_param.copy_(model_param)
+            
+    for ema_buffer, model_buffer in zip(ema_model.buffers(), model_mod.buffers()):
+        if ema_buffer.dtype.is_floating_point:
+            ema_buffer.mul_(decay).add_(model_buffer, alpha=1 - decay)
+        else:
+            ema_buffer.copy_(model_buffer)
 @torch.no_grad()
 def run_validation(classifier, val_loader, device):
     # Bypass DDP: this runs on rank 0 only, so forwarding through the DDP
@@ -223,12 +225,11 @@ def train_worker(rank, world_size):
     
     train_loader = DataLoader(
         train_dataset, batch_size=local_batch_size, 
-        sampler=train_sampler, drop_last=True, num_workers=4, pin_memory=True
+        sampler=train_sampler, drop_last=True, num_workers=2, pin_memory=True
     )
 
     val_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="val")
-    # Validation usually happens on Rank 0 only to avoid complex metric gathering
-    val_loader = DataLoader(val_dataset, batch_size=local_batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=local_batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     fid_metric = None
     real_ref_imgs = None
@@ -469,14 +470,19 @@ def main():
     world_size = torch.cuda.device_count()
     if world_size < 2:
         print("⚠️ Only 1 GPU detected. Running strictly on Single GPU pipeline.")
-        # Setup standalone environment variables to satisfy DDP initialization on single-GPU
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
+        os.environ['TORCH_NCCL_ENABLE_MONITORING'] = '0' # 🚀 ADD THIS
         train_worker(0, 1)
     else:
         # Spawn DDP processes for Dual T4 / Multi-GPU set up
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
+        
+        # 🚀 ADD THESE TWO LINES: Stop the watchdog from killing the FID calculation
+        os.environ['TORCH_NCCL_ENABLE_MONITORING'] = '0'
+        os.environ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC'] = '3600'
+        
         mp.spawn(train_worker, args=(world_size,), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
