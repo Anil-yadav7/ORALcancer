@@ -14,7 +14,7 @@ from gan_model import Generator, Critic
 from classifier import OSCC_Classifier
 from torchvision.utils import save_image
 import torch.backends.cudnn as cudnn
-from datetime import timedelta # 🚀 CHANGE 4a: Import timedelta
+from datetime import timedelta 
 
 # --- DISTRIBUTED IMPORTS ---
 import torch.distributed as dist
@@ -24,7 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 # Enable cuDNN auto-tuner for static image sizes
 cudnn.benchmark = True   
-torch.set_float32_matmul_precision('high') # 🚀 CHANGE 2: Enable TF32 for Tensor Cores
+torch.set_float32_matmul_precision('high') 
 
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
 GLOBAL_BATCH_SIZE = 64      
@@ -35,10 +35,8 @@ LAMBDA_GP = 10
 LAMBDA_PERC = 0.5    
 N_CRITIC = 3         
 
-# --- EMA / validation / FID settings ---
+# --- EMA / validation settings ---
 EMA_DECAY = 0.999
-FID_EVERY = 20               
-FID_NUM_SAMPLES = 300
 LR_DECAY_START_EPOCH = 100
 GEN_GRAD_CLIP_NORM = 5.0
 
@@ -121,6 +119,7 @@ def update_ema(ema_model, model, decay):
             ema_buffer.mul_(decay).add_(model_buffer, alpha=1 - decay)
         else:
             ema_buffer.copy_(model_buffer)
+
 @torch.no_grad()
 def run_validation(classifier, val_loader, device):
     # Bypass DDP: this runs on rank 0 only, so forwarding through the DDP
@@ -154,38 +153,6 @@ def run_validation(classifier, val_loader, device):
     macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     return avg_loss, acc, macro_f1
 
-def build_fid_metric(device):
-    try:
-        from torchmetrics.image.fid import FrechetInceptionDistance
-    except ImportError:
-        return None
-    return FrechetInceptionDistance(feature=2048, normalize=False).to(device)
-
-def to_uint8(img_batch):
-    img = ((img_batch + 1.0) / 2.0).clamp(0, 1)
-    return (img * 255).to(torch.uint8)
-
-@torch.no_grad()
-def compute_fid(fid_metric, ema_gen, real_ref_imgs, num_classes, z_dim, device, num_samples):
-    fid_metric.reset()
-    real_batch = to_uint8(real_ref_imgs[:num_samples].to(device))
-    fid_metric.update(real_batch, real=True)
-    ema_gen.eval()
-    fake_batches = []
-    remaining = num_samples
-    bs = 32
-    while remaining > 0:
-        cur = min(bs, remaining)
-        noise = torch.randn(cur, z_dim, device=device)
-        labels = torch.randint(0, num_classes, (cur,), device=device)
-        fakes = ema_gen(noise, labels)
-        fake_batches.append(to_uint8(fakes))
-        remaining -= cur
-    ema_gen.train()
-    fake_batch = torch.cat(fake_batches, dim=0)
-    fid_metric.update(fake_batch, real=False)
-    return fid_metric.compute().item()
-
 def get_state_dict(model):
     if isinstance(model, DDP):
         model = model.module
@@ -208,7 +175,7 @@ def train_worker(rank, world_size):
         backend="nccl", 
         rank=rank, 
         world_size=world_size,
-        timeout=timedelta(minutes=45) # 🚀 CHANGE 4b: Override 10-minute timeout
+        timeout=timedelta(minutes=45)
     )
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
@@ -230,26 +197,6 @@ def train_worker(rank, world_size):
 
     val_dataset = OSCCDataset(root_dir=KAGGLE_DATA_PATH, phase="val")
     val_loader = DataLoader(val_dataset, batch_size=local_batch_size, shuffle=False, num_workers=2, pin_memory=True)
-
-    fid_metric = None
-    real_ref_imgs = None
-    if rank == 0:
-        fid_metric = build_fid_metric(device)
-        if fid_metric is not None:
-            ref_imgs_list = []
-            collected = 0
-            for imgs, _ in val_loader:
-                ref_imgs_list.append(imgs)
-                collected += imgs.size(0)
-                if collected >= FID_NUM_SAMPLES:
-                    break
-            if len(ref_imgs_list) == 0:
-                print(f"⚠️  val_loader returned 0 images from '{KAGGLE_DATA_PATH}' (phase='val'). "
-                      f"Skipping FID tracking for this run -- check that your data preprocessing "
-                      f"step ran and populated this path before main() was called.")
-                fid_metric = None
-            else:
-                real_ref_imgs = torch.cat(ref_imgs_list, dim=0)[:FID_NUM_SAMPLES]
 
     # 3. Base Models Initialization
     gen = Generator(noise_dim=Z_DIM, num_classes=NUM_CLASSES).to(device)
@@ -354,7 +301,7 @@ def train_worker(rank, world_size):
                 gp = compute_gradient_penalty(critic, real_imgs, fake_imgs.detach(), labels, device)
                 loss_critic = loss_critic_base + (LAMBDA_GP * gp)
 
-                opt_critic.zero_grad(set_to_none=True) # 🚀 CHANGE 3: set_to_none=True
+                opt_critic.zero_grad(set_to_none=True)
                 scaler_critic.scale(loss_critic).backward()
                 scaler_critic.step(opt_critic)
                 scaler_critic.update()
@@ -376,7 +323,7 @@ def train_worker(rank, world_size):
                 loss_gen_perc = perceptual_loss_fn(fresh_fake_imgs, real_imgs).mean()
                 loss_gen = loss_gen_adv + (LAMBDA_PERC * loss_gen_perc)
 
-            opt_gen.zero_grad(set_to_none=True) # 🚀 CHANGE 3: set_to_none=True
+            opt_gen.zero_grad(set_to_none=True)
             scaler_gen.scale(loss_gen).backward()
             scaler_gen.unscale_(opt_gen)
             
@@ -385,9 +332,7 @@ def train_worker(rank, world_size):
             scaler_gen.step(opt_gen)
             scaler_gen.update()
 
-            # EMA must be updated identically on every rank: gen's DDP-synced weights
-            # are already identical across ranks after backward, so this stays cheap
-            # and in sync everywhere -- and it lets every rank safely use ema_gen below.
+            # EMA must be updated identically on every rank
             update_ema(ema_gen, gen, EMA_DECAY)
 
             # ---------------------
@@ -395,9 +340,7 @@ def train_worker(rank, world_size):
             # ---------------------
             with torch.no_grad():
                 ema_noise = torch.randn(cur_batch_size, Z_DIM, device=device)
-                
                 ema_fake_imgs = ema_gen(ema_noise, labels)
-                    
                 aug_real_imgs = classifier_augment(real_imgs)
 
             with torch.amp.autocast('cuda'):
@@ -411,7 +354,7 @@ def train_worker(rank, world_size):
                 preds = classifier(pooled_imgs_norm)
                 loss_class = criterion_class(preds, pooled_labels)
 
-            opt_class.zero_grad(set_to_none=True) # 🚀 CHANGE 3: set_to_none=True
+            opt_class.zero_grad(set_to_none=True)
             scaler_class.scale(loss_class).backward()
             scaler_class.step(opt_class)
             scaler_class.update()
@@ -429,10 +372,6 @@ def train_worker(rank, world_size):
 
             val_loss, val_acc, val_f1 = run_validation(classifier, val_loader, device)
             print(f"   ↳ VAL | Loss: {val_loss:.4f} | Accuracy: {val_acc:.4f} | Macro-F1: {val_f1:.4f}")
-
-            if fid_metric is not None and (epoch + 1) % FID_EVERY == 0:
-                fid_score = compute_fid(fid_metric, ema_gen, real_ref_imgs, NUM_CLASSES, Z_DIM, device, FID_NUM_SAMPLES)
-                print(f"   ↳ FID (real vs. EMA-generated, n={FID_NUM_SAMPLES}): {fid_score:.2f}")
 
             ema_gen.eval()
             with torch.no_grad():
@@ -461,7 +400,7 @@ def train_worker(rank, world_size):
             }
             torch.save(checkpoint_dict, SAVE_CHECKPOINT_PATH)
             
-        # 🚀 CHANGE 4c: Add Synchronization Barrier
+        # Synchronization Barrier
         dist.barrier() 
 
     dist.destroy_process_group()
@@ -472,14 +411,14 @@ def main():
         print("⚠️ Only 1 GPU detected. Running strictly on Single GPU pipeline.")
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
-        os.environ['TORCH_NCCL_ENABLE_MONITORING'] = '0' # 🚀 ADD THIS
+        os.environ['TORCH_NCCL_ENABLE_MONITORING'] = '0' 
         train_worker(0, 1)
     else:
         # Spawn DDP processes for Dual T4 / Multi-GPU set up
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
         
-        # 🚀 ADD THESE TWO LINES: Stop the watchdog from killing the FID calculation
+        # Stop watchdog timeouts during heavy rank 0 validation/logging
         os.environ['TORCH_NCCL_ENABLE_MONITORING'] = '0'
         os.environ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC'] = '3600'
         
