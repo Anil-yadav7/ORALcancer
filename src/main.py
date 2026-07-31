@@ -14,6 +14,7 @@ from gan_model import Generator, Critic
 from classifier import OSCC_Classifier
 from torchvision.utils import save_image
 import torch.backends.cudnn as cudnn
+from datetime import timedelta # 🚀 CHANGE 4a: Import timedelta
 
 # --- DISTRIBUTED IMPORTS ---
 import torch.distributed as dist
@@ -23,6 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 # Enable cuDNN auto-tuner for static image sizes
 cudnn.benchmark = True   
+torch.set_float32_matmul_precision('high') # 🚀 CHANGE 2: Enable TF32 for Tensor Cores
 
 # --- KAGGLE OPTIMIZED HYPERPARAMETERS ---
 GLOBAL_BATCH_SIZE = 64      
@@ -200,7 +202,12 @@ def train_worker(rank, world_size):
     DDP Worker Process. Runs exactly once per GPU.
     """
     # 1. Initialize Distributed Process Group
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        backend="nccl", 
+        rank=rank, 
+        world_size=world_size,
+        timeout=timedelta(minutes=45) # 🚀 CHANGE 4b: Override 10-minute timeout
+    )
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
 
@@ -279,6 +286,7 @@ def train_worker(rank, world_size):
         if rank == 0: print("⚙️ Compiling models for PyTorch 2.0 speedup...")
         torch._dynamo.config.suppress_errors = True
         gen = torch.compile(gen)
+        critic = torch.compile(critic) # 🚀 CHANGE 1: Compile Critic
         classifier = torch.compile(classifier)
         ema_gen = torch.compile(ema_gen)
 
@@ -346,7 +354,7 @@ def train_worker(rank, world_size):
                 gp = compute_gradient_penalty(critic, real_imgs, fake_imgs.detach(), labels, device)
                 loss_critic = loss_critic_base + (LAMBDA_GP * gp)
 
-                opt_critic.zero_grad()
+                opt_critic.zero_grad(set_to_none=True) # 🚀 CHANGE 3: set_to_none=True
                 scaler_critic.scale(loss_critic).backward()
                 scaler_critic.step(opt_critic)
                 scaler_critic.update()
@@ -368,7 +376,7 @@ def train_worker(rank, world_size):
                 loss_gen_perc = perceptual_loss_fn(fresh_fake_imgs, real_imgs).mean()
                 loss_gen = loss_gen_adv + (LAMBDA_PERC * loss_gen_perc)
 
-            opt_gen.zero_grad()
+            opt_gen.zero_grad(set_to_none=True) # 🚀 CHANGE 3: set_to_none=True
             scaler_gen.scale(loss_gen).backward()
             scaler_gen.unscale_(opt_gen)
             
@@ -403,7 +411,7 @@ def train_worker(rank, world_size):
                 preds = classifier(pooled_imgs_norm)
                 loss_class = criterion_class(preds, pooled_labels)
 
-            opt_class.zero_grad()
+            opt_class.zero_grad(set_to_none=True) # 🚀 CHANGE 3: set_to_none=True
             scaler_class.scale(loss_class).backward()
             scaler_class.step(opt_class)
             scaler_class.update()
@@ -452,6 +460,9 @@ def train_worker(rank, world_size):
                 'val_macro_f1': val_f1,
             }
             torch.save(checkpoint_dict, SAVE_CHECKPOINT_PATH)
+            
+        # 🚀 CHANGE 4c: Add Synchronization Barrier
+        dist.barrier() 
 
     dist.destroy_process_group()
 
