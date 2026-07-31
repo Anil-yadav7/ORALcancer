@@ -48,7 +48,7 @@ CLASS_WEIGHT_DECAY = 1e-4
 CLASS_PARTIAL_FREEZE = True
 CLASS_PARTIAL_FREEZE_RATIO = 0.7
 
-LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/anil701/oraldatset/oscc_checkpoint.bin"
+LOAD_CHECKPOINT_PATH = "/kaggle/input/datasets/anil701/checkpoint99/oscc_checkpoint.bin"
 SAVE_CHECKPOINT_PATH = "/kaggle/working/oscc_checkpoint.pth"
 
 # --- VGG PERCEPTUAL LOSS MODULE ---
