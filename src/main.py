@@ -107,9 +107,9 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, labels, device)
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay):
-    # DDP unwrap
-    model_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-    ema_model_dict = ema_model.state_dict()
+    # 🚀 ROBUST UNWRAPPING: Utilize state dict helper to bypass DDP and torch.compile wrapper mismatches
+    model_dict = get_state_dict(model)
+    ema_model_dict = get_state_dict(ema_model)
     
     for key in ema_model_dict.keys():
         ema_tensor = ema_model_dict[key]
@@ -286,7 +286,6 @@ def train_worker(rank, world_size):
         if rank == 0: print("⚙️ Compiling models for PyTorch 2.0 speedup...")
         torch._dynamo.config.suppress_errors = True
         gen = torch.compile(gen)
-        critic = torch.compile(critic) # 🚀 CHANGE 1: Compile Critic
         classifier = torch.compile(classifier)
         ema_gen = torch.compile(ema_gen)
 
